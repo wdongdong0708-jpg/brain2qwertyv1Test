@@ -109,7 +109,9 @@ cd /content/code
 git pull --ff-only
 ```
 
-后续命令使用 `/content/b2q-venv/bin/python`；安装脚本保留 Colab 当前的 torch/torchvision/torchaudio，不将其替换为 CPU wheel。创建环境时不依赖系统 ensurepip；发现缺少 pip 时先尝试 virtualenv，再用官方 get-pip.py 补齐，也会修复之前部分创建但没有 pip 的环境。本地完整训练验证使用 Python 3.12；CI 单独检查 Python 3.13 的 pip 引导。
+后续命令使用 `/content/b2q-venv/bin/python`；安装脚本保留 Colab 当前的 torch/torchvision/torchaudio，不将其替换为 CPU wheel。新环境优先使用 `virtualenv --system-site-packages` 创建；未安装 virtualenv 时自动安装。如果创建失败，则使用 `with_pip=False` 创建环境，再用官方 get-pip.py 补齐 pip。之前部分创建但没有 pip 的环境也会自动修复。全程不依赖系统 ensurepip。CI 单独检查 Python 3.13 的新建环境与 pip 修复。
+
+两个 Notebook 的安装、cache、打包/解压、train 单元使用相同的 `run_live` 流式输出助手：合并标准输出与错误输出，按行刷新；Python 子进程使用 `-u`，报错堆栈会原样显示，失败时终止该单元。直接选择「全部运行」，不需要临时删环境、修改源码或手动替换路径。Colab 首次挂载 Drive 仍需完成 Google 的授权交互。
 
 两个 Notebook 的第一个单元会创建本地软链接。手动运行时，在每个 CPU/GPU 实例先执行一次以下 Bash 准备：
 

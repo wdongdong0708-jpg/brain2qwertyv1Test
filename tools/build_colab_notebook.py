@@ -91,6 +91,7 @@ def build(*, gpu_metadata=None):
             原始数据保留在 Drive；本流程调用同一套 `Experiment.data.build()`，不创建神经网络或 GPU Trainer。
             优先读取 `data/SpanishBCBL`，同时兼容 `data/SpanishBCBL_Full`。
             CPU/GPU 统一使用本地 `/content/studies_links` 软链接与 `/content/local_cache` 缓存，避免在 Drive 创建软链接或写入 exca 缓存。
+            使用「全部运行」即可依次完成环境安装、缓存预热和归档；耗时步骤会实时显示日志与报错。
             首次全量预处理可能很久；当前运行时内重跑会复用已完成的缓存。预热完成后执行归档单元，将缓存持久保存到 Drive。
             """,
             ),
@@ -128,6 +129,7 @@ def build(*, gpu_metadata=None):
             原始数据路径、数据版本、滤波和采样参数必须与预热阶段一致。
             `--require-cache` 禁止补算原始信号；缺失缓存会立即报错。
             `--resume auto` 恢复同一目录的 last.ckpt；总轮数仍是 EPOCHS，不会额外再加 EPOCHS。
+            使用「全部运行」即可依次完成安装、缓存解压和训练；耗时步骤会实时显示日志与报错。
             """,
             ),
             common[0],
@@ -168,17 +170,18 @@ run_live([PYTHON, "-c", "import torch, brain2qwerty_v1; print('GPU available:', 
     }
     for name, cells in notebooks.items():
         runtime_metadata = {}
+        previous = gpu_metadata if name == "colab_gpu_train.ipynb" else None
+        if previous is None and (destination / name).is_file():
+            previous = json.loads((destination / name).read_text(encoding="utf-8"))[
+                "metadata"
+            ]
+        runtime_keys = (
+            ("accelerator", "colab") if name == "colab_gpu_train.ipynb" else ("colab",)
+        )
+        runtime_metadata = {
+            key: previous[key] for key in runtime_keys if previous and key in previous
+        }
         if name == "colab_gpu_train.ipynb":
-            previous = gpu_metadata
-            if previous is None and (destination / name).is_file():
-                previous = json.loads((destination / name).read_text(encoding="utf-8"))[
-                    "metadata"
-                ]
-            runtime_metadata = {
-                key: previous[key]
-                for key in ("accelerator", "colab")
-                if previous and key in previous
-            }
             runtime_metadata.setdefault("accelerator", "GPU")
         notebook = {
             "nbformat": 4,

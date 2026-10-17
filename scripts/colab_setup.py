@@ -1,5 +1,6 @@
 import argparse
 import importlib.metadata
+import importlib.util
 import os
 import subprocess
 import sys
@@ -16,25 +17,30 @@ def pip_available(python: Path) -> bool:
     return result.returncode == 0
 
 
-def ensure_pip(python: Path, environment: Path) -> None:
+def create_virtualenv(environment: Path) -> None:
+    """Seed pip without invoking the runtime's optional ensurepip module."""
+    if importlib.util.find_spec("virtualenv") is None:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "virtualenv"], check=True
+        )
+    subprocess.run(
+        [sys.executable, "-m", "virtualenv", "--system-site-packages", str(environment)],
+        check=True,
+    )
+
+
+def ensure_pip(python: Path, environment: Path, *, try_virtualenv: bool = True) -> None:
     """Repair new or partially created Colab environments without ensurepip."""
     if pip_available(python):
         return
-    print("Venv has no usable pip; bootstrapping with virtualenv...", flush=True)
-    try:
-        subprocess.run([sys.executable, "-m", "pip", "install", "virtualenv"], check=True)
-        subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "virtualenv",
-                "--system-site-packages",
-                str(environment),
-            ],
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as exc:
-        print(f"virtualenv bootstrap failed ({exc}); trying get-pip.py...", flush=True)
+    if try_virtualenv:
+        print("Venv has no usable pip; bootstrapping with virtualenv...", flush=True)
+        try:
+            create_virtualenv(environment)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(
+                f"virtualenv bootstrap failed ({exc}); trying get-pip.py...", flush=True
+            )
     if pip_available(python):
         return
     with tempfile.TemporaryDirectory(prefix="b2q-pip-") as folder:
@@ -49,9 +55,16 @@ def ensure_pip(python: Path, environment: Path) -> None:
 def prepare_environment(environment: Path) -> Path:
     python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     if not python.exists():
-        # Some Colab Python 3.13 distributions do not provide working ensurepip.
-        # Create the interpreter first so a missing pip cannot abort venv creation.
-        venv.EnvBuilder(with_pip=False, system_site_packages=True).create(environment)
+        try:
+            create_virtualenv(environment)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            print(
+                f"virtualenv creation failed ({exc}); using venv + get-pip.py...",
+                flush=True,
+            )
+            venv.EnvBuilder(with_pip=False, system_site_packages=True).create(environment)
+            ensure_pip(python, environment, try_virtualenv=False)
+            return python
     ensure_pip(python, environment)
     return python
 

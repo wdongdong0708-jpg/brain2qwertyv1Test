@@ -2,6 +2,7 @@ import ast
 import io
 import json
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
@@ -9,6 +10,7 @@ from unittest.mock import MagicMock, Mock
 import pytest
 
 from scripts import colab_setup
+from tools import build_colab_notebook
 from tools.build_colab_notebook import ROOT, SETUP
 
 
@@ -22,10 +24,11 @@ def test_existing_pip_does_not_bootstrap(monkeypatch, tmp_path):
 
 def test_missing_pip_is_seeded_with_virtualenv_and_system_packages(monkeypatch, tmp_path):
     monkeypatch.setattr(colab_setup, "pip_available", Mock(side_effect=[False, True]))
+    monkeypatch.setattr(colab_setup.importlib.util, "find_spec", lambda _: None)
     run = Mock()
     monkeypatch.setattr(colab_setup.subprocess, "run", run)
     colab_setup.ensure_pip(tmp_path / "bin/python", tmp_path)
-    assert run.call_args_list[0].args[0][-3:] == ["pip", "install", "virtualenv"]
+    assert run.call_args_list[0].args[0][-4:] == ["pip", "install", "-q", "virtualenv"]
     assert run.call_args_list[1].args[0][-3:] == [
         "virtualenv",
         "--system-site-packages",
@@ -78,12 +81,47 @@ def test_prepare_environment_handles_existing_venv_without_pip(monkeypatch, tmp_
 def test_prepare_environment_does_not_require_ensurepip(monkeypatch, tmp_path):
     builder = Mock()
     ensure = Mock()
+    virtualenv = Mock()
     monkeypatch.setattr(colab_setup.venv, "EnvBuilder", builder)
     monkeypatch.setattr(colab_setup, "ensure_pip", ensure)
+    monkeypatch.setattr(colab_setup, "create_virtualenv", virtualenv)
     colab_setup.prepare_environment(tmp_path)
+    virtualenv.assert_called_once_with(tmp_path)
+    builder.assert_not_called()
+    ensure.assert_called_once()
+
+
+def test_new_environment_falls_back_without_ensurepip_or_retrying_virtualenv(
+    monkeypatch, tmp_path
+):
+    builder = Mock()
+    ensure = Mock()
+    virtualenv = Mock(side_effect=subprocess.CalledProcessError(1, "virtualenv"))
+    monkeypatch.setattr(colab_setup.venv, "EnvBuilder", builder)
+    monkeypatch.setattr(colab_setup, "ensure_pip", ensure)
+    monkeypatch.setattr(colab_setup, "create_virtualenv", virtualenv)
+    python = colab_setup.prepare_environment(tmp_path)
+    virtualenv.assert_called_once_with(tmp_path)
     builder.assert_called_once_with(with_pip=False, system_site_packages=True)
     builder.return_value.create.assert_called_once_with(tmp_path)
-    ensure.assert_called_once()
+    ensure.assert_called_once_with(python, tmp_path, try_virtualenv=False)
+
+
+def test_installed_virtualenv_does_not_need_another_pip_install(monkeypatch, tmp_path):
+    monkeypatch.setattr(colab_setup.importlib.util, "find_spec", lambda _: object())
+    run = Mock()
+    monkeypatch.setattr(colab_setup.subprocess, "run", run)
+    colab_setup.create_virtualenv(tmp_path)
+    run.assert_called_once_with(
+        [
+            colab_setup.sys.executable,
+            "-m",
+            "virtualenv",
+            "--system-site-packages",
+            str(tmp_path),
+        ],
+        check=True,
+    )
 
 
 @pytest.mark.parametrize(
@@ -148,6 +186,12 @@ def test_both_notebooks_share_identical_setup_and_local_cache():
                 ast.parse("".join(entry["source"]))
         assert "cache_persisted" not in json.dumps(notebook)
     assert '"pack"' in "".join(cpu["cells"][-1]["source"])
+    assert "archives/features.tar" in "".join(cpu["cells"][-1]["source"])
+    assert "archives/features.tar" in "".join(gpu["cells"][3]["source"])
+    for notebook, mode in ((cpu, "cache"), (gpu, "train")):
+        source = "\n".join("".join(entry["source"]) for entry in notebook["cells"])
+        assert f'run_live([PYTHON, "-u", "-m", "brain2qwerty_v1", "{mode}"' in source
+        assert "rm -rf" not in source and "sed -i" not in source
 
 
 @pytest.mark.parametrize("returncode", [0, 7])
@@ -172,3 +216,54 @@ def test_live_commands_stream_logs_and_propagate_failure(monkeypatch, capsys, re
     else:
         namespace["run_live"](["training-command"])
     assert capsys.readouterr().out == "Epoch 1\nloss=1.0\n"
+
+
+def test_real_child_traceback_is_visible_in_notebook_output(capsys):
+    helper = next(
+        node
+        for node in ast.parse(SETUP).body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_live"
+    )
+    namespace = {"subprocess": subprocess}
+    exec(
+        compile(ast.Module(body=[helper], type_ignores=[]), "run_live", "exec"), namespace
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        namespace["run_live"](
+            [
+                sys.executable,
+                "-u",
+                "-c",
+                "import sys; print('cache progress', flush=True); print('stderr detail', file=sys.stderr); raise RuntimeError('child failed')",
+            ]
+        )
+    output = capsys.readouterr().out
+    assert "cache progress" in output and "stderr detail" in output
+    assert "Traceback (most recent call last)" in output
+    assert "RuntimeError: child failed" in output
+
+
+def test_regeneration_preserves_colab_hardware_settings_and_is_repeatable(
+    monkeypatch, tmp_path
+):
+    destination = tmp_path / "notebooks"
+    destination.mkdir()
+    metadata = {
+        "colab_cpu_cache.ipynb": {"colab": {"machine_shape": "hm"}},
+        "colab_gpu_train.ipynb": {"accelerator": "GPU", "colab": {"gpuType": "T4"}},
+    }
+    for name, settings in metadata.items():
+        (destination / name).write_text(
+            json.dumps({"metadata": settings}), encoding="utf-8"
+        )
+    monkeypatch.setattr(build_colab_notebook, "ROOT", tmp_path)
+    build_colab_notebook.build()
+    generated = {name: (destination / name).read_bytes() for name in metadata}
+    for name, settings in metadata.items():
+        result = json.loads(generated[name])
+        assert all(result["metadata"][key] == value for key, value in settings.items())
+    build_colab_notebook.build()
+    assert all(
+        (destination / name).read_bytes() == content
+        for name, content in generated.items()
+    )
