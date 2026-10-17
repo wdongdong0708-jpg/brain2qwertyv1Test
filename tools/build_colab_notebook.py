@@ -92,6 +92,7 @@ def build(*, gpu_metadata=None):
             优先读取 `data/SpanishBCBL`，同时兼容 `data/SpanishBCBL_Full`。
             CPU/GPU 统一使用本地 `/content/studies_links` 软链接与 `/content/local_cache` 缓存，避免在 Drive 创建软链接或写入 exca 缓存。
             使用「全部运行」即可依次完成环境安装、缓存预热和归档；耗时步骤会实时显示日志与报错。
+            默认预热全量；也可通过 `SUBJECT_ARGS` 指定多人名单或前 N 个有效受试者。
             首次全量预处理可能很久；当前运行时内重跑会复用已完成的缓存。预热完成后执行归档单元，将缓存持久保存到 Drive。
             """,
             ),
@@ -101,9 +102,12 @@ def build(*, gpu_metadata=None):
                 """
             MODALITIES = ["eeg", "meg"]
             CPU_THREADS = 2
+            SUBJECT_ARGS = ["--subject", "all"]
+            # For a subset: ["--num-subjects", "10"] or ["--subjects", "002", "003"]
             for modality in MODALITIES:
                 run_live([PYTHON, "-u", "-m", "brain2qwerty_v1", "cache",
-                          "--modality", modality, "--cpu-threads", str(CPU_THREADS)])
+                          "--modality", modality, *SUBJECT_ARGS,
+                          "--cpu-threads", str(CPU_THREADS)])
             """,
             ),
             cell(
@@ -130,6 +134,7 @@ def build(*, gpu_metadata=None):
             `--require-cache` 禁止补算原始信号；缺失缓存会立即报错。
             `--resume auto` 恢复同一目录的 last.ckpt；总轮数仍是 EPOCHS，不会额外再加 EPOCHS。
             使用「全部运行」即可依次完成安装、缓存解压和训练；耗时步骤会实时显示日志与报错。
+            `SUBJECT_ARGS` 可选择全量、单人、固定多人名单或前 N 个有效受试者；实际名单保存为 `subjects.json`。
             """,
             ),
             common[0],
@@ -153,11 +158,14 @@ run_live([PYTHON, "-c", "import torch, brain2qwerty_v1; print('GPU available:', 
                 "code",
                 """
             MODALITY = "eeg"   # eeg / meg
-            SUBJECT = "all"    # 002 for one EEG subject; S2 for one MEG subject
+            SUBJECT_ARGS = ["--subject", "all"]
+            # 10 participants: ["--num-subjects", "10"]
+            # Fixed list: ["--subjects", "002", "003", "004"]
+            # One participant: ["--subject", "002"] (EEG) or ["--subject", "S2"] (MEG)
             EPOCHS = 300       # finite total budget; resume must keep the original value
             SEED = 33
             run_live([PYTHON, "-u", "-m", "brain2qwerty_v1", "train",
-                      "--modality", MODALITY, "--subject", SUBJECT,
+                      "--modality", MODALITY, *SUBJECT_ARGS,
                       "--seed", str(SEED), "--epochs", str(EPOCHS),
                       "--devices", "1", "--require-cache", "--resume", "auto"])
             """,

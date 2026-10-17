@@ -23,7 +23,7 @@ from .config.xp_config import experiment_config
 from .context import LOCAL_CONTEXT
 from .main import Experiment
 from .scripts.single_subject import subject_labels
-from .utils import select_participants
+from .utils import CONTROL_SUBJECTS, EXCLUDED_SUBJECTS, select_participants
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -58,10 +58,21 @@ def parser() -> argparse.ArgumentParser:
     )
     p.add_argument("mode", choices=["cache", "smoke", "train", "eval", "debug"])
     p.add_argument("--modality", choices=["eeg", "meg"], default="eeg")
-    p.add_argument(
+    subjects = p.add_mutually_exclusive_group()
+    subjects.add_argument(
         "--subject",
         default="all",
         help="002 or S2; omitted/all selects every valid subject",
+    )
+    subjects.add_argument(
+        "--subjects",
+        nargs="+",
+        help="Fixed participant list, separated by spaces or commas (e.g. 002 003 004)",
+    )
+    subjects.add_argument(
+        "--num-subjects",
+        type=int,
+        help="Select the first N available, valid participants in numeric ID order",
     )
     p.add_argument("--data-root", "--studies-root", type=Path)
     p.add_argument("--cache-root", type=Path)
@@ -131,7 +142,76 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
-def make_config(args) -> dict:
+def subject_order(subject: str) -> int:
+    return int(subject.rsplit("/", 1)[-1].lstrip("Ss"))
+
+
+def requested_subjects(args) -> list[str] | None:
+    """Canonical participant IDs; MEG aliases must not inflate the requested count."""
+    values = args.subjects
+    if values is None:
+        if args.subject.lower() == "all":
+            return None
+        values = [args.subject]
+    participants = []
+    for value in values:
+        for token in value.split(",") if args.subjects is not None else [value]:
+            token = token.strip()
+            if not re.fullmatch(r"(?:Pinet2024(?:Eeg|Meg)/)?[Ss]?[0-9]+", token):
+                raise ValueError(
+                    f"Invalid subject ID: {token!r}; use IDs such as 002 or S2"
+                )
+            if "/" in token and not token.startswith(
+                "Pinet2024Eeg/" if args.modality == "eeg" else "Pinet2024Meg/"
+            ):
+                raise ValueError(f"Subject {token!r} does not belong to {args.modality}")
+            canonical = subject_labels(args.modality, token)[0]
+            if canonical in CONTROL_SUBJECTS | EXCLUDED_SUBJECTS:
+                raise ValueError(f"{canonical} is excluded by the official preprocessing")
+            if canonical in participants:
+                raise ValueError(
+                    f"Duplicate participant {canonical}: repeated IDs or MEG aliases refer to the same person"
+                )
+            participants.append(canonical)
+    return sorted(participants, key=subject_order)
+
+
+def select_subjects(summary, requested=None, count=None) -> list[str]:
+    available = sorted(select_participants(summary).subject.unique(), key=subject_order)
+    if requested is not None:
+        missing = set(requested) - set(available)
+        if missing:
+            raise ValueError(
+                f"No valid recordings for requested subjects: {sorted(missing, key=subject_order)}; "
+                f"available participants: {available}"
+            )
+        return requested
+    if count is not None:
+        if count < 1:
+            raise ValueError("--num-subjects must be positive")
+        if len(available) < count:
+            raise ValueError(
+                f"Requested {count} participants, but only {len(available)} valid participants "
+                f"are available: {available}"
+            )
+        return available[:count]
+    return available
+
+
+def subject_tag(args, subjects) -> str:
+    if args.subjects is None and args.num_subjects is None:
+        return args.subject.lower()
+    if subjects is None:
+        # Temporary discovery config, replaced before creating an experiment directory.
+        return f"first-{args.num_subjects}"
+    digest = hashlib.sha256(json.dumps(subjects).encode()).hexdigest()[:12]
+    return f"subjects-{len(subjects)}-{digest}"
+
+
+def make_config(args, *, selected_subjects=None) -> dict:
+    subjects = (
+        selected_subjects if selected_subjects is not None else requested_subjects(args)
+    )
     cfg = experiment_config()
     cache = (
         (args.cache_root or Path(cfg["data"]["neuro"]["infra"]["folder"]))
@@ -153,10 +233,13 @@ def make_config(args) -> dict:
             "keep_in_ram": False,
         },
     )
-    if args.subject.lower() != "all":
-        cfg["data"]["study"]["query"] = (
-            f"subject in {subject_labels(args.modality, args.subject)!r}"
-        )
+    if subjects is not None:
+        labels = [
+            label
+            for subject in subjects
+            for label in subject_labels(args.modality, subject)
+        ]
+        cfg["data"]["study"]["query"] = f"subject in {labels!r}"
     cfg["data"]["neuro"].update(
         name="EegExtractor" if args.modality == "eeg" else "MegExtractor",
         mne_cpus=args.cpu_threads,
@@ -195,7 +278,7 @@ def make_config(args) -> dict:
             if torch.cuda.is_available()
             else "32-true"
         )
-    tag = f"{args.modality}-{args.subject.lower()}-{args.context_mode}-{args.profile}"
+    tag = f"{args.modality}-{subject_tag(args, subjects)}-{args.context_mode}-{args.profile}"
     cfg.update(
         output_dir=str(
             (args.run_dir or results / tag / args.mode).expanduser().resolve()
@@ -343,6 +426,7 @@ def main(argv=None) -> None:
         "val_batches",
         "test_batches",
         "expected_timelines",
+        "num_subjects",
     ):
         value = getattr(args, name)
         if value is not None and value < 1:
@@ -356,16 +440,29 @@ def main(argv=None) -> None:
     if args.mode == "eval" and (not args.ckpt or not args.ckpt.is_file()):
         p.error("eval requires an existing --ckpt")
     torch.set_num_threads(args.cpu_threads)
-    cfg = make_config(args)
+    try:
+        requested = requested_subjects(args)
+        cfg = make_config(args)
+    except ValueError as error:
+        p.error(str(error))
     Path(cfg["data"]["neuro"]["infra"]["folder"]).mkdir(parents=True, exist_ok=True)
     Path(cfg["data"]["study"]["infra"]["folder"]).mkdir(parents=True, exist_ok=True)
-    output = Path(cfg["output_dir"])
-    output.mkdir(parents=True, exist_ok=True)
     if args.mode != "cache" and not torch.cuda.is_available():
         p.error("smoke/train/eval requires a CUDA GPU; select a GPU runtime")
     # Study discovery reads filenames and logs, without constructing a neural model.
     xp = WorkflowExperiment(**cfg)
-    summary = xp.data.study.study_summary()
+    summary = xp.data.study.study_summary(apply_query=False)
+    try:
+        subjects = select_subjects(summary, requested, args.num_subjects)
+    except ValueError as error:
+        p.error(str(error))
+    if args.num_subjects is not None:
+        cfg = make_config(args, selected_subjects=subjects)
+        xp = WorkflowExperiment(**cfg)
+    if xp.data.study.query is not None:
+        summary = xp.data.study.study_summary()
+    output = Path(cfg["output_dir"])
+    output.mkdir(parents=True, exist_ok=True)
     if summary.empty:
         raise RuntimeError("No valid recordings matched this subject/modality")
     if args.expected_timelines is not None and len(summary) != args.expected_timelines:
@@ -406,6 +503,21 @@ def main(argv=None) -> None:
     if wb:
         cfg["wandb_config"] = wb
     write_json(output / "config.json", cfg)
+    selection = {
+        "mode": "first"
+        if args.num_subjects is not None
+        else "list"
+        if args.subjects is not None
+        else "subject",
+        "subject": args.subject
+        if args.subjects is None and args.num_subjects is None
+        else None,
+        "requested_subjects": args.subjects,
+        "num_subjects": args.num_subjects,
+        "subjects": subjects,
+        "participants": participants,
+    }
+    write_json(output / "subjects.json", selection)
     summary.to_csv(output / "recordings.csv", index=False)
     xp = WorkflowExperiment(**cfg)
     configure_cache(xp.data, read_only=args.require_cache)
@@ -415,6 +527,7 @@ def main(argv=None) -> None:
         f"Selected {len(summary)} timelines, {participants} participants; cache UIDs: {signature}",
         flush=True,
     )
+    print(f"Selected subjects: {', '.join(subjects)}", flush=True)
     started = time.monotonic()
     write_json(output / "status.json", {"state": "building_cache", "mode": args.mode})
     try:
@@ -422,7 +535,8 @@ def main(argv=None) -> None:
         audit = audit_loaders(loaders, output)
         manifest = {
             "modality": args.modality,
-            "subject": args.subject,
+            "subject": subject_tag(args, subjects),
+            "subjects": subjects,
             "study_path": str(xp.data.study.path),
             "timelines": len(summary),
             "participants": participants,
@@ -431,7 +545,8 @@ def main(argv=None) -> None:
         }
         key = hashlib.sha256(
             json.dumps(
-                {"path": manifest["study_path"], "subject": args.subject}, sort_keys=True
+                {"path": manifest["study_path"], "subject": manifest["subject"]},
+                sort_keys=True,
             ).encode()
         ).hexdigest()[:12]
         write_json(

@@ -151,6 +151,8 @@ export PY=/content/b2q-venv/bin/python
 
 不传 `--subject` 等同 `--subject all`。想先预热一人可加 `--subject 002`（EEG）或 `--subject S2`（MEG）。缓存模式只创建配置对象并调用官方 `Experiment.data.build()`；不构建神经网络、不创建 Trainer、不初始化 CUDA。
 
+也可使用下文的 `--subjects` 或 `--num-subjects` 只预热一个多人子集。已有全量缓存可直接供子集训练使用，无需再预热。
+
 预处理保持 0.1–20 Hz 滤波、50 Hz 重采样、RobustScaler、原 DTW 对齐和句子划分。逐记录写入 `/content/local_cache`；同一运行时内重跑可利用已完成记录。预热完成后执行 pack，将完整缓存持久保存为 Drive 的 `archives/features.tar`；Colab 运行时释放后，本地缓存会消失。默认串行处理记录，用 `--cpu-threads` 控制每段 MNE 的 CPU 数；未缓存的单段原始数据仍需足够内存。
 
 打包应在预热结束后执行。tar 使用未压缩格式，减少解压 CPU 开销；耗时由缓存大小、Drive 吞吐和实例磁盘决定，不保证全量缓存秒级完成。GPU 本地盘必须容得下解压后的缓存。
@@ -181,6 +183,40 @@ export PY=/content/b2q-venv/bin/python
 
 这三条训练命令是可选实验，按需选择执行。`--precision auto` 在支持时使用 bf16，否则使用 fp16；设备数固定为 1。MEG 自动切换 `Pinet2024Meg + MegExtractor + ENCODER`（含 2D 空间 Merger）。
 
+### 多受试者子集：例如只训练 10 人
+
+下面的命令接在本节的环境准备和缓存解压之后执行：
+
+```bash
+# 按编号数值排序，选择前 10 个有有效记录的 EEG 受试者
+"$PY" -u -m brain2qwerty_v1 train --modality eeg --num-subjects 10 --devices 1 --epochs 300 --require-cache --resume auto
+
+# MEG 同样支持；按官方规则合并重复编号、排除对照及排除受试者后选 10 人
+"$PY" -u -m brain2qwerty_v1 train --modality meg --num-subjects 10 --devices 1 --epochs 300 --require-cache --resume auto
+
+# 或指定固定名单；可列出任意数量的有效编号，包括固定的 10 人
+"$PY" -u -m brain2qwerty_v1 train --modality eeg --subjects 002 003 004 --epochs 300 --require-cache --resume auto
+# 逗号分隔也支持：--subjects 002,003,004
+```
+
+`--subject`、`--subjects` 和 `--num-subjects` 三选一；不传则保持全量训练。两种新参数同样适用于 `cache`、`smoke`、`eval`，并保留每个所选受试者的全部有效记录。网络中的受试者专属层以及 MEG Merger 的人数自动按实际独立人数设置。
+
+`--num-subjects 10` 不是抽取前 10 段记录，也不随机抽人。它从当前数据目录的有效受试者中按编号数值排序后选择；EEG 的 001 等读取器已排除的受试者不计数。MEG 的 S18/S1、S14/S4、S10/S21/S5 分别属于同一个人，选择其任一编号会包含对应的重复记录；固定名单重复指定同一人会报错。找不到名单中的某人，或有效人数不足 N 时，在信号预处理和训练之前报错，不会自动缩小人数。
+
+启动时打印实际名单，并保存到实验目录的 `subjects.json`；`recordings.csv` 保存该名单对应的实际记录。固定名单输入顺序、补零方式和 MEG 别名不会改变最终选择。多人实验目录名使用 `eeg-subjects-10-<名单哈希>-sentence-full/train/` 等形式；不同名单分开保存，同一名单的数量选择与显式名单选择可以恢复同一实验。单人和全量实验仍使用原来的目录名。
+
+若以后添加或移除原始数据，自动选择的前 N 人可能变化。正式实验建议根据 `subjects.json` 固定 `--subjects` 名单；续训和评估使用同一名单及相同训练配置。多人子集应从自己的 checkpoint 恢复，全量训练的 checkpoint 不作为子集实验的续训断点。
+
+在两个 Colab Notebook 的运行单元中，将 `SUBJECT_ARGS` 设置为以下任意一种即可；默认仍为全量：
+
+```python
+SUBJECT_ARGS = ["--subject", "all"]              # 全量
+SUBJECT_ARGS = ["--num-subjects", "10"]         # 前 10 个有效受试者
+SUBJECT_ARGS = ["--subjects", "002", "003", "004"]  # 固定名单，可列出 10 人
+```
+
+已有全量 `features.tar` 时，GPU Notebook 解压后即可选子集训练；`--require-cache` 继续保证缺失缓存时报错。多人筛选不修改滤波、重采样、DTW、缓存版本或信号缓存 UID。
+
 CPU 归档、GPU 解压到本地磁盘可减少 Drive 上大量小文件操作；这也符合官方 Colab [FAQ](https://research.google.com/colaboratory/faq.html) 的建议。当前 Notebook 始终将 exca 缓存放在 `/content/local_cache`。
 
 `--require-cache` 对 timeline、神经特征以及 MEG 坐标缓存使用 exca 的 `read-only` 模式。缺失缓存会报错，提示回 CPU 实例补齐。缓存目录搬到 NVMe 不改变 exca UID；cache/smoke/train 共用配置，所有模式都使用相同的 Windows/Linux 安全 item 哈希。全量缓存可以供单被试使用，神经特征的 item key 不依赖子集中的受试者重编码序号。
@@ -192,6 +228,7 @@ CPU 归档、GPU 解压到本地磁盘可减少 Drive 上大量小文件操作�
 | 文件 | 用途 |
 |---|---|
 | `config.json`, `environment.json` | 配置、依赖、GPU、Git 版本 |
+| `subjects.json` | 受试者选择方式、实际规范编号名单、独立人数 |
 | `recordings.csv`, `data_audit.json`, `sentence_splits.csv` | 实际记录、样本数量、句子划分 |
 | `cache_signature.json` | 实际 exca timeline / neuro UID |
 | `status.json`, `gradient_audit.json` | 运行状态、指标、首次有效 CNN 梯度 |
@@ -209,7 +246,7 @@ Checkpoint 和日志直接写入 Drive，不依赖 Colab 本地盘存活。Check
 "$PY" -m brain2qwerty_v1 eval --modality eeg --require-cache --ckpt "$BRAIN2QWERTY_RESULTS/eeg-all-sentence-full/train/best.ckpt"
 ```
 
-Lightning 再次改善选模时可能生成 `best-v1.ckpt` 等文件，以训练日志给出的最佳路径为准。单被试或 small 模型评估需加与训练一致的 `--subject`、`--profile`、`--context-mode`。
+Lightning 再次改善选模时可能生成 `best-v1.ckpt` 等文件，以训练日志给出的最佳路径为准。子集或 small 模型评估需使用与训练一致的受试者选择参数（`--subject` / `--subjects` / `--num-subjects` 三选一）、`--profile`、`--context-mode`。
 
 改动滤波/采样 CLI 配置会由 exca 参数哈希区分；直接改对齐或预处理实现后，需要给预热和训练同时加新的 `--cache-version 2`。只修改 CNN / Transformer 或 batch / 精度不需要重建信号缓存。不同受试者范围会重新做该范围的句子划分，信号与 DTW 缓存仍可复用。
 

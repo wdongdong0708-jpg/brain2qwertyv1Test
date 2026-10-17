@@ -267,3 +267,45 @@ def test_regeneration_preserves_colab_hardware_settings_and_is_repeatable(
         (destination / name).read_bytes() == content
         for name, content in generated.items()
     )
+
+
+@pytest.mark.parametrize(
+    "name,mode", [("colab_cpu_cache.ipynb", "cache"), ("colab_gpu_train.ipynb", "train")]
+)
+@pytest.mark.parametrize(
+    "flags",
+    [["--subject", "all"], ["--num-subjects", "10"], ["--subjects", "002", "003", "004"]],
+)
+def test_notebook_passes_selected_participants_to_each_command(name, mode, flags):
+    notebook = json.loads((ROOT / "notebooks" / name).read_text(encoding="utf-8"))
+    source = next(
+        "".join(entry["source"])
+        for entry in notebook["cells"]
+        if entry["cell_type"] == "code" and "SUBJECT_ARGS =" in "".join(entry["source"])
+    )
+    tree = ast.parse(source)
+    assignment = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "SUBJECT_ARGS"
+            for target in node.targets
+        )
+    )
+    assignment.value = ast.parse(repr(flags), mode="eval").body
+    ast.fix_missing_locations(tree)
+    commands = []
+    exec(
+        compile(tree, "participant_selection_cell", "exec"),
+        {"PYTHON": "python", "run_live": commands.append},
+    )
+    assert len(commands) == (2 if mode == "cache" else 1)
+    for command in commands:
+        assert command[4] == mode
+        index = command.index(flags[0])
+        assert command[index : index + len(flags)] == flags
+        assert (
+            sum(flag in command for flag in ("--subject", "--subjects", "--num-subjects"))
+            == 1
+        )
