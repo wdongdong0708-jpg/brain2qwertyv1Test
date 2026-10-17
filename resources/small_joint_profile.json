@@ -1,0 +1,21 @@
+{
+  "protocol": "pretrained_cnn_small_transformer_joint_finetuning",
+  "seed": 33,
+  "modes": ["full_s33", "r8_s33"],
+  "encoder_run": "outputs/eeg-002/context_research_seed33/runs/cnn_pretrain_s33",
+  "frozen_reference": "outputs/eeg-002/fast_context_seed33",
+  "context_dim": 256,
+  "transformer_depth": 2,
+  "transformer_heads": 4,
+  "ff_mult": 2,
+  "batch_keystroke_budget": 256,
+  "max_epochs": 40,
+  "early_stopping_patience": 6,
+  "encoder_max_lr": 0.00005,
+  "decoder_max_lr": 0.0003,
+  "weight_decay": 0.001,
+  "gradient_clip_val": 1.0,
+  "precision": "bf16-mixed",
+  "test_evaluated": false,
+  "note": "Same pretrained CNN and exactly matching decoder initialization as the frozen-feature control. CNN is trainable from epoch 1; BN/dropout follow train mode. Best weights are saved on validation CE improvement and resumable state every 5 epochs."
+}
