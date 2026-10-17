@@ -13,6 +13,33 @@ on:
     branches: [main]
 
 jobs:
+  colab-bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install bootstrap test tools
+        run: python -m pip install pytest virtualenv
+      - name: Colab setup tests
+        run: python -m pytest tests/test_colab_setup.py -q
+      - name: Repair a Python 3.13 venv without pip
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import venv
+          from pathlib import Path
+          from scripts.colab_setup import ensure_pip
+
+          environment = Path(os.environ["RUNNER_TEMP"]) / "colab-no-pip"
+          venv.EnvBuilder(with_pip=False).create(environment)
+          python = environment / "bin/python"
+          ensure_pip(python, environment)
+          subprocess.run([str(python), "-m", "pip", "--version"], check=True)
+          PY
+
   test:
     runs-on: ubuntu-latest
     strategy:

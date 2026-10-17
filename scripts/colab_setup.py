@@ -1,9 +1,59 @@
 import argparse
 import importlib.metadata
+import os
 import subprocess
 import sys
+import tempfile
 import venv
 from pathlib import Path
+from urllib.request import urlopen
+
+
+def pip_available(python: Path) -> bool:
+    result = subprocess.run(
+        [str(python), "-m", "pip", "--version"], capture_output=True, text=True
+    )
+    return result.returncode == 0
+
+
+def ensure_pip(python: Path, environment: Path) -> None:
+    """Repair new or partially created Colab environments without ensurepip."""
+    if pip_available(python):
+        return
+    print("Venv has no usable pip; bootstrapping with virtualenv...", flush=True)
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "virtualenv"], check=True)
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "virtualenv",
+                "--system-site-packages",
+                str(environment),
+            ],
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"virtualenv bootstrap failed ({exc}); trying get-pip.py...", flush=True)
+    if pip_available(python):
+        return
+    with tempfile.TemporaryDirectory(prefix="b2q-pip-") as folder:
+        bootstrap = Path(folder) / "get-pip.py"
+        with urlopen("https://bootstrap.pypa.io/get-pip.py", timeout=60) as response:
+            bootstrap.write_bytes(response.read())
+        subprocess.run([str(python), str(bootstrap)], check=True)
+    if not pip_available(python):
+        raise RuntimeError(f"pip is still unavailable in {python}")
+
+
+def prepare_environment(environment: Path) -> Path:
+    python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    if not python.exists():
+        # Some Colab Python 3.13 distributions do not provide working ensurepip.
+        # Create the interpreter first so a missing pip cannot abort venv creation.
+        venv.EnvBuilder(with_pip=False, system_site_packages=True).create(environment)
+    ensure_pip(python, environment)
+    return python
 
 
 def main():
@@ -25,14 +75,13 @@ def main():
                 raise RuntimeError(
                     "Install a compatible PyTorch runtime before V1 dependencies"
                 ) from None
-    if not (args.venv / "bin/python").exists():
-        venv.EnvBuilder(with_pip=True, system_site_packages=True).create(args.venv)
+    python = prepare_environment(args.venv)
     constraint_file = args.venv / "runtime-constraints.txt"
     constraint_file.write_text("\n".join(constraints) + "\n", encoding="utf-8")
     requirements = Path(__file__).resolve().parents[1] / "requirements-v1-colab.txt"
     subprocess.run(
         [
-            str(args.venv / "bin/python"),
+            str(python),
             "-m",
             "pip",
             "install",
@@ -43,7 +92,7 @@ def main():
         ],
         check=True,
     )
-    print(f"V1 ready: {args.venv / 'bin/python'}", flush=True)
+    print(f"V1 ready: {python}", flush=True)
 
 
 if __name__ == "__main__":

@@ -121,6 +121,8 @@ def test_data_check_can_be_followed_by_training_and_completed_run_does_not_resta
         "n_epochs": 2, "patience": 6, "precision": "32-true", "data": {"filter": (0.1, 20.0)},
     })
     monkeypatch.setattr(colab_train, "save_environment", lambda _: None)
+    # This synthetic test uses a CPU Trainer, including on GitHub runners.
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda *_: "synthetic CPU test")
     monkeypatch.setattr(colab_train, "build_data", lambda *args: (None, {"train": loader, "val": loader}, {"splits": {"train": {"keystrokes": 6}}}))
     built = []
 

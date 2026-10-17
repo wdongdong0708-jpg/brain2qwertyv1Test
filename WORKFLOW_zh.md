@@ -8,8 +8,8 @@
 
 | 配置项 | 本地默认 | 云端 CPU | 云端 GPU |
 |---|---|---|---|
-| `BRAIN2QWERTY_STUDIES` / `--data-root` | `<仓库>/workspace/data` | `$WS/data` | `$WS/data` |
-| `BRAIN2QWERTY_CACHE` / `--cache-root` | `<仓库>/workspace/cache` | `$WS/cache_persisted` | `/content/local_cache` |
+| `BRAIN2QWERTY_STUDIES` / `--data-root` | `<仓库>/workspace/data` | `/content/studies_links` | `/content/studies_links` |
+| `BRAIN2QWERTY_CACHE` / `--cache-root` | `<仓库>/workspace/cache` | `/content/local_cache` | `/content/local_cache` |
 | `BRAIN2QWERTY_RESULTS` / `--results-root` | `<仓库>/workspace/runs` | `$WS/runs` | `$WS/runs` |
 
 命令行路径优先于环境变量；环境变量在每次生成配置时读取。`--run-dir` 可以直接指定一个实验的输出目录。
@@ -19,17 +19,19 @@
 ```text
 Brain2Qwerty_Workspace/
   data/
-    SpanishBCBL_Full/
+    SpanishBCBL/                  # 同时兼容 SpanishBCBL_Full/
       EEG/EEG/       EEG/logs/
       MEG/MEG/       MEG/logs/     # 原来的 MEG/FIF/ 也支持
-    Pinet2024Eeg -> SpanishBCBL_Full
-    Pinet2024Meg -> SpanishBCBL_Full
-  cache_persisted/
   archives/
   runs/
+
+/content/studies_links/           # Colab 本地磁盘上的软链接
+  Pinet2024Eeg -> <Drive raw>
+  Pinet2024Meg -> <Drive raw>
+/content/local_cache/             # CPU 预热、GPU 解压后读取的统一缓存路径
 ```
 
-读取器支持 study 名称子目录，也支持直接传完整下载目录；如果 Drive 不支持软链接，会自动从 `data/SpanishBCBL_Full` 寻址。无需复制数百 GB 数据。EEG 日志兼容 `S2_session1_block1_*.mat`、`EEG002_session1_block1_*.mat` 等命名；有多个候选日志时明确报错。MEG 保留原始 S1/S2 第二次 session 的日志交换规则和已知坏记录排除规则。
+两个 Notebook 优先选择 `data/SpanishBCBL`，缺失时选择 `data/SpanishBCBL_Full`。软链接创建在 Colab 本地 `/content/studies_links`，指向云盘原始数据；CPU/GPU 都用这个 study 根目录及 `/content/local_cache`，避免在 Drive 创建软链接或写入 exca 工作缓存造成 `Errno 95`。无需复制数百 GB 数据。EEG 日志兼容 `S2_session1_block1_*.mat`、`EEG002_session1_block1_*.mat` 等命名；有多个候选日志时明确报错。MEG 保留原始 S1/S2 第二次 session 的日志交换规则和已知坏记录排除规则。
 
 段数由有效文件与日志动态发现。默认不再强制 EEG=62 或固定 MEG 段数；可用 `--expected-timelines 4` 为本地子集加显式校验。全量模式会包含读取器筛选后的全部有效记录，不包含官方已排除的坏记录、对照等。
 
@@ -107,7 +109,25 @@ cd /content/code
 git pull --ff-only
 ```
 
-后续命令使用 `/content/b2q-venv/bin/python`；安装脚本保留 Colab 当前的 torch/torchvision/torchaudio，不将其替换为 CPU wheel。本项目验证的 Python 版本是 3.12。
+后续命令使用 `/content/b2q-venv/bin/python`；安装脚本保留 Colab 当前的 torch/torchvision/torchaudio，不将其替换为 CPU wheel。创建环境时不依赖系统 ensurepip；发现缺少 pip 时先尝试 virtualenv，再用官方 get-pip.py 补齐，也会修复之前部分创建但没有 pip 的环境。本地完整训练验证使用 Python 3.12；CI 单独检查 Python 3.13 的 pip 引导。
+
+两个 Notebook 的第一个单元会创建本地软链接。手动运行时，在每个 CPU/GPU 实例先执行一次以下 Bash 准备：
+
+```bash
+export WS=/content/drive/MyDrive/Brain2Qwerty_Workspace
+RAW="$WS/data/SpanishBCBL"
+if [ ! -d "$RAW" ]; then RAW="$WS/data/SpanishBCBL_Full"; fi
+test -d "$RAW" || exit 1
+mkdir -p /content/studies_links /content/local_cache "$WS/archives" "$WS/runs"
+for study in Pinet2024Eeg Pinet2024Meg; do
+  alias_path="/content/studies_links/$study"
+  if [ -e "$alias_path" ] && [ ! -L "$alias_path" ]; then
+    echo "Expected a symlink: $alias_path" >&2
+    exit 1
+  fi
+  ln -sfn "$RAW" "$alias_path"
+done
+```
 
 ## 4. 云端纯 CPU：预热全量 EEG 和 MEG
 
@@ -116,8 +136,8 @@ git pull --ff-only
 ```bash
 cd /content/code
 export WS=/content/drive/MyDrive/Brain2Qwerty_Workspace
-export BRAIN2QWERTY_STUDIES="$WS/data"
-export BRAIN2QWERTY_CACHE="$WS/cache_persisted"
+export BRAIN2QWERTY_STUDIES=/content/studies_links
+export BRAIN2QWERTY_CACHE=/content/local_cache
 export BRAIN2QWERTY_RESULTS="$WS/runs"
 export PY=/content/b2q-venv/bin/python
 
@@ -129,7 +149,7 @@ export PY=/content/b2q-venv/bin/python
 
 不传 `--subject` 等同 `--subject all`。想先预热一人可加 `--subject 002`（EEG）或 `--subject S2`（MEG）。缓存模式只创建配置对象并调用官方 `Experiment.data.build()`；不构建神经网络、不创建 Trainer、不初始化 CUDA。
 
-预处理保持 0.1–20 Hz 滤波、50 Hz 重采样、RobustScaler、原 DTW 对齐和句子划分。逐记录持久化；中断后重跑可利用已完成的记录。默认串行处理记录，用 `--cpu-threads` 控制每段 MNE 的 CPU 数；未缓存的单段原始数据仍需足够内存。
+预处理保持 0.1–20 Hz 滤波、50 Hz 重采样、RobustScaler、原 DTW 对齐和句子划分。逐记录写入 `/content/local_cache`；同一运行时内重跑可利用已完成记录。预热完成后执行 pack，将完整缓存持久保存为 Drive 的 `archives/features.tar`；Colab 运行时释放后，本地缓存会消失。默认串行处理记录，用 `--cpu-threads` 控制每段 MNE 的 CPU 数；未缓存的单段原始数据仍需足够内存。
 
 打包应在预热结束后执行。tar 使用未压缩格式，减少解压 CPU 开销；耗时由缓存大小、Drive 吞吐和实例磁盘决定，不保证全量缓存秒级完成。GPU 本地盘必须容得下解压后的缓存。
 
@@ -140,7 +160,7 @@ export PY=/content/b2q-venv/bin/python
 ```bash
 cd /content/code
 export WS=/content/drive/MyDrive/Brain2Qwerty_Workspace
-export BRAIN2QWERTY_STUDIES="$WS/data"
+export BRAIN2QWERTY_STUDIES=/content/studies_links
 export BRAIN2QWERTY_CACHE=/content/local_cache
 export BRAIN2QWERTY_RESULTS="$WS/runs"
 export PY=/content/b2q-venv/bin/python
@@ -159,7 +179,7 @@ export PY=/content/b2q-venv/bin/python
 
 这三条训练命令是可选实验，按需选择执行。`--precision auto` 在支持时使用 bf16，否则使用 fp16；设备数固定为 1。MEG 自动切换 `Pinet2024Meg + MegExtractor + ENCODER`（含 2D 空间 Merger）。
 
-不归档时，也可将 `BRAIN2QWERTY_CACHE` 直接设成 `$WS/cache_persisted`，但每 batch 的小文件读取可能受 Drive 延迟影响。官方 Colab [FAQ](https://research.google.com/colaboratory/faq.html) 也建议减少挂载 Drive 上的大量小文件操作，并在运行时本地处理归档内容。
+CPU 归档、GPU 解压到本地磁盘可减少 Drive 上大量小文件操作；这也符合官方 Colab [FAQ](https://research.google.com/colaboratory/faq.html) 的建议。当前 Notebook 始终将 exca 缓存放在 `/content/local_cache`。
 
 `--require-cache` 对 timeline、神经特征以及 MEG 坐标缓存使用 exca 的 `read-only` 模式。缺失缓存会报错，提示回 CPU 实例补齐。缓存目录搬到 NVMe 不改变 exca UID；cache/smoke/train 共用配置，所有模式都使用相同的 Windows/Linux 安全 item 哈希。全量缓存可以供单被试使用，神经特征的 item key 不依赖子集中的受试者重编码序号。
 
