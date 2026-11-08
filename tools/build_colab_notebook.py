@@ -149,10 +149,43 @@ run_live([PYTHON, "-c", "import torch, brain2qwerty_v1; print('GPU available:', 
                 "code",
                 """
             os.environ["BRAIN2QWERTY_CACHE"] = "/content/local_cache"
-            run_live([PYTHON, "-u", "-m", "scripts.cache_archive", "unpack",
-                      "--archive", str(WORKSPACE / "archives/features.tar"),
-                      "--cache-root", os.environ["BRAIN2QWERTY_CACHE"]])
+            for archive_path in (WORKSPACE / "archives/features_meg.tar", WORKSPACE / "archives/features.tar"):
+                if archive_path.is_file():
+                    print(f"Unpacking {archive_path} -> {os.environ['BRAIN2QWERTY_CACHE']}...", flush=True)
+                    run_live([PYTHON, "-u", "-m", "scripts.cache_archive", "unpack",
+                              "--archive", str(archive_path),
+                              "--cache-root", os.environ["BRAIN2QWERTY_CACHE"]])
             """,
+            ),
+            cell(
+                "markdown",
+                """
+            ## 实验 A：词级打字时长捷径验证（Clean `0s` vs. Shifted `-15s ~ -120s`）
+            直接复用已解压的缓存，在 Colab 中自动下载/缓存 `BAAI/bge-m3` 西班牙语词向量，对比：
+            - `Timing-Only (Δτ_i)`（零脑信号纯打字间隔基线）
+            - `Word-Only (Stage 1 CNN)`
+            - `Full-Context (Joint, Unfrozen CNN)` vs. `Full-Context (+ Freeze CNN)`
+            - `Rolling-K0/K1/K2 (+ Freeze CNN + LOO-CMS)`
+            验证结果实时打印 Markdown 汇总表，并保存到 Drive 的 `runs/<tag>/shortcut_verification.{md,csv,json}`。
+            """,
+            ),
+            cell(
+                "code",
+                """
+            SHORTCUT_MODALITY = "meg"   # meg (features_meg.tar) / eeg (features.tar)
+            SHORTCUT_SUBJECTS = ["--subject", "all"]
+            WINDOW_DURATION = 1.0       # 1.0 (重叠约 67%) 或 0.5 (重叠约 34%)
+            SHORTCUT_EPOCHS = 20
+            run_live([PYTHON, "-u", "-m", "brain2qwerty_v1.scripts.verify_word_shortcut",
+                      "--modality", SHORTCUT_MODALITY, *SHORTCUT_SUBJECTS,
+                      "--window-duration", str(WINDOW_DURATION),
+                      "--epochs", str(SHORTCUT_EPOCHS),
+                      "--require-cache"])
+            """,
+            ),
+            cell(
+                "markdown",
+                "## 实验 B：原始 V1 键击级完整训练（可选）",
             ),
             cell(
                 "code",

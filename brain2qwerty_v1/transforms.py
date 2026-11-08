@@ -141,6 +141,306 @@ class SpanishBCBLPreprocessing(EventsTransform):
         return events
 
 
+SPANISH_FUNCTION_WORDS = frozenset(
+    {
+        "a",
+        "al",
+        "ante",
+        "bajo",
+        "como",
+        "con",
+        "contra",
+        "cuando",
+        "de",
+        "del",
+        "desde",
+        "donde",
+        "durante",
+        "el",
+        "ella",
+        "ellas",
+        "ellos",
+        "en",
+        "entre",
+        "era",
+        "es",
+        "esa",
+        "esas",
+        "ese",
+        "eso",
+        "esos",
+        "esta",
+        "estaba",
+        "estan",
+        "estas",
+        "este",
+        "esto",
+        "estos",
+        "fue",
+        "ha",
+        "han",
+        "hasta",
+        "hay",
+        "la",
+        "las",
+        "le",
+        "les",
+        "lo",
+        "los",
+        "mas",
+        "me",
+        "mi",
+        "mis",
+        "muy",
+        "ni",
+        "no",
+        "nos",
+        "nosotros",
+        "o",
+        "otra",
+        "otras",
+        "otro",
+        "otros",
+        "para",
+        "pero",
+        "por",
+        "porque",
+        "que",
+        "quien",
+        "se",
+        "ser",
+        "si",
+        "sin",
+        "sobre",
+        "son",
+        "su",
+        "sus",
+        "tambien",
+        "tan",
+        "te",
+        "todo",
+        "todos",
+        "tu",
+        "tus",
+        "un",
+        "una",
+        "unas",
+        "uno",
+        "unos",
+        "y",
+        "ya",
+        "yo",
+    }
+)
+
+
+def normalize_spanish_word(word: object) -> str:
+    """Normalize a Spanish word token to lowercase ASCII matching SpanishBCBL logs."""
+    if pd.isna(word):
+        return ""
+    text = str(word).strip().lower()
+    for src, dst in (
+        ("á", "a"),
+        ("é", "e"),
+        ("í", "i"),
+        ("ó", "o"),
+        ("ú", "u"),
+        ("ü", "u"),
+        ("ñ", "n"),
+        ("à", "a"),
+    ):
+        text = text.replace(src, dst)
+    for ch in (",", ".", "!", "?", ";", ":", "-", "_", '"', "'", "\ufeff"):
+        text = text.replace(ch, "")
+    return "".join(c for c in text if c.isalnum())
+
+
+class SpanishBCBLWordPreprocessing(EventsTransform):
+    """Extract typing-phase Word events while preserving exact V1 cache keys and sentence splits."""
+
+    def _run(self, events: pd.DataFrame) -> pd.DataFrame:
+        events = events.copy()
+        events["type"] = events["type"].replace(
+            {"Button": "Keystroke", "DetectedButton": "Keystroke"}
+        )
+
+        # drop the two practice trials of each block (NaN trial_id on Meg/Eeg rows is kept)
+        events = events[~events["trial_id"].isin([0.0, 1.0])]
+
+        # keep the 19 unique MEG participants / valid EEG participants and factorize subject IDs
+        events = select_participants(events)
+        events["subject"] = pd.factorize(events["subject"])[0]
+
+        if "sentence_UID" not in events.columns:
+            events["sentence_UID"] = (
+                events["trial_id"].astype(str) + "_" + events["timeline"].astype(str)
+            )
+        events = events[
+            events["sentence_UID"]
+            != "65.0_Pinet2024Meg_subject-S1_session-1_task-block1"
+        ]
+
+        # Ensure Keystroke rows carry sentence text for deterministic Brain2QwertyV1Splitter
+        ks_mask = events["type"] == "Keystroke"
+        if "true_sequence" in events.columns:
+            events.loc[ks_mask & events["sentence"].isna(), "sentence"] = events.loc[
+                ks_mask & events["sentence"].isna(), "true_sequence"
+            ]
+
+        # Extract or synthesize typing-phase Word rows (is_percep == False)
+        word_mask = events["type"] == "Word"
+        if "is_percep" in events.columns:
+            typing_word_mask = word_mask & (events["is_percep"] == False)  # noqa: E712
+            percep_word_mask = word_mask & (events["is_percep"] == True)  # noqa: E712
+            events = events[~percep_word_mask].copy()
+        else:
+            typing_word_mask = word_mask
+
+        if not typing_word_mask.any() and ks_mask.any():
+            # Fallback for synthetic keystroke-only fixtures: group keystrokes by space/&
+            synthesized = self._synthesize_words_from_keystrokes(events[ks_mask])
+            if not synthesized.empty:
+                events = pd.concat([events, synthesized], ignore_index=True)
+
+        # Clean typing-phase Word rows and compute word-level timing grid delta_tau
+        is_word = events["type"] == "Word"
+        if is_word.any():
+            sent_by_uid = (
+                events.loc[events["type"] == "Keystroke"]
+                .dropna(subset=["sentence"])
+                .groupby("sentence_UID")["sentence"]
+                .first()
+                .to_dict()
+            )
+            words_df = events.loc[is_word].copy()
+            words_df["sentence"] = words_df["sentence_UID"].map(sent_by_uid).fillna(
+                words_df["sentence"]
+            )
+            if "true_sequence" in words_df.columns:
+                words_df["sentence"] = words_df["sentence"].fillna(
+                    words_df["true_sequence"]
+                )
+            events.loc[is_word, "sentence"] = words_df["sentence"]
+            words_df["word_clean"] = words_df["text"].map(normalize_spanish_word)
+            valid_word = (
+                words_df["word_clean"].notna()
+                & (words_df["word_clean"] != "")
+                & (words_df["text"].astype(str).str.upper() != "FAILED")
+                & (words_df["duration"] > 0)
+                & words_df["sentence"].notna()
+            )
+            bad_word_indices = words_df.index[~valid_word]
+            if len(bad_word_indices) > 0:
+                events = events.drop(index=bad_word_indices).copy()
+
+            is_word = events["type"] == "Word"
+            words_sorted = events.loc[is_word].sort_values(["sentence_UID", "start"])
+            word_order = words_sorted.groupby("sentence_UID").cumcount()
+            sent_word_count = words_sorted.groupby("sentence_UID")["start"].transform(
+                "count"
+            )
+            next_start = words_sorted.groupby("sentence_UID")["start"].shift(-1)
+            delta_tau = (next_start - words_sorted["start"]).fillna(
+                words_sorted["duration"]
+            )
+            delta_tau = delta_tau.clip(lower=0.05)
+            clean_tokens = words_sorted["text"].map(normalize_spanish_word)
+
+            events.loc[words_sorted.index, "text"] = clean_tokens
+            events.loc[words_sorted.index, "word_order"] = word_order.astype(int)
+            events.loc[words_sorted.index, "sentence_word_count"] = (
+                sent_word_count.astype(int)
+            )
+            events.loc[words_sorted.index, "char_length"] = clean_tokens.str.len().astype(
+                int
+            )
+            events.loc[words_sorted.index, "delta_tau"] = delta_tau.astype(float)
+            events.loc[words_sorted.index, "is_function_word"] = clean_tokens.isin(
+                SPANISH_FUNCTION_WORDS
+            ).astype(bool)
+            events.loc[words_sorted.index, "word_UID"] = (
+                words_sorted["sentence_UID"].astype(str)
+                + "_word_"
+                + (word_order + 1).astype(str)
+            )
+
+        # Keep stable button_UID on Keystroke rows
+        keystroke_mask = events["type"] == "Keystroke"
+        ks = events.loc[keystroke_mask].sort_values("start")
+        if len(ks) > 0:
+            counter = ks.groupby("sentence_UID").cumcount() + 1
+            events.loc[keystroke_mask, "button_UID"] = (
+                ks["sentence_UID"] + "_button_" + counter.astype(str)
+            )
+
+        columns_to_drop = [
+            "word_id",
+            "word_index",
+            "trigger",
+            "time",
+            "pressed",
+            "key",
+            "is_key",
+            "stim",
+            "char_id",
+            "is_left_key",
+            "dropped_char_per",
+            "context",
+        ]
+        events = events.drop(
+            columns=[c for c in columns_to_drop if c in events.columns]
+        )
+        return events.reset_index(drop=True)
+
+    @staticmethod
+    def _synthesize_words_from_keystrokes(ks_df: pd.DataFrame) -> pd.DataFrame:
+        word_rows: list[dict] = []
+        for suid, group in ks_df.sort_values("start").groupby("sentence_UID", sort=False):
+            current_chars: list[str] = []
+            first_start: float | None = None
+            last_stop: float = 0.0
+            first_row = group.iloc[0]
+            for _, row in group.iterrows():
+                btn = str(row.get("button", row.get("text", "")))
+                if btn in (" ", "&", "<space>"):
+                    if current_chars and first_start is not None:
+                        w_text = normalize_spanish_word("".join(current_chars))
+                        if w_text:
+                            w_row = first_row.to_dict()
+                            w_row.update(
+                                type="Word",
+                                text=w_text,
+                                start=float(first_start),
+                                duration=max(0.05, float(last_stop - first_start)),
+                                stop=float(last_stop),
+                                is_percep=False,
+                            )
+                            word_rows.append(w_row)
+                    current_chars = []
+                    first_start = None
+                else:
+                    if first_start is None:
+                        first_start = float(row["start"])
+                    last_stop = float(
+                        row.get("stop", float(row["start"]) + float(row.get("duration", 0.1)))
+                    )
+                    current_chars.append(btn)
+            if current_chars and first_start is not None:
+                w_text = normalize_spanish_word("".join(current_chars))
+                if w_text:
+                    w_row = first_row.to_dict()
+                    w_row.update(
+                        type="Word",
+                        text=w_text,
+                        start=float(first_start),
+                        duration=max(0.05, float(last_stop - first_start)),
+                        stop=float(last_stop),
+                        is_percep=False,
+                    )
+                    word_rows.append(w_row)
+        return pd.DataFrame(word_rows)
+
+
 class Brain2QwertyV1Splitter(EventsTransform):
     """Sentence-level train/val/test split with no paraphrase leakage.
 
