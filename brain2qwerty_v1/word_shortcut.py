@@ -250,8 +250,15 @@ def load_or_compute_bge_m3_embeddings(
         raise ValueError("Vocabulary word list cannot be empty")
 
     if backend == "hash":
-        mat = np.stack([_hash_word_embedding(w, embedding_dim) for w in unique_words])
-        return unique_words, mat.astype(np.float32)
+        raw_emb = np.stack(
+            [_hash_word_embedding(w, embedding_dim) for w in unique_words]
+        ).astype(np.float32)
+        vocab_mean = raw_emb.mean(axis=0, keepdims=True)
+        centered_emb = raw_emb - vocab_mean
+        embedding_matrix_np = centered_emb / np.clip(
+            np.linalg.norm(centered_emb, axis=-1, keepdims=True), 1e-12, None
+        )
+        return unique_words, embedding_matrix_np.astype(np.float32)
 
     cached_map: dict[str, np.ndarray] = {}
     for path in cache_paths:
@@ -327,16 +334,13 @@ def load_or_compute_bge_m3_embeddings(
                 except Exception:
                     continue
 
-    bge_matrix = np.stack([cached_map[w] for w in unique_words]).astype(np.float32)
-    bge_norms = np.linalg.norm(bge_matrix, axis=-1, keepdims=True)
-    bge_matrix = bge_matrix / np.maximum(bge_norms, 1e-12)
-    ortho_matrix = np.stack(
-        [_hash_word_embedding(w, embedding_dim) for w in unique_words]
-    ).astype(np.float32)
-    matrix = 0.72 * bge_matrix + 0.28 * ortho_matrix
-    norms = np.linalg.norm(matrix, axis=-1, keepdims=True)
-    matrix = (matrix / np.maximum(norms, 1e-12)).astype(np.float32)
-    return unique_words, matrix
+    raw_emb = np.stack([cached_map[w] for w in unique_words]).astype(np.float32)
+    vocab_mean = raw_emb.mean(axis=0, keepdims=True)
+    centered_emb = raw_emb - vocab_mean
+    embedding_matrix_np = centered_emb / np.clip(
+        np.linalg.norm(centered_emb, axis=-1, keepdims=True), 1e-12, None
+    )
+    return unique_words, embedding_matrix_np.astype(np.float32)
 
 
 def build_vocabulary_banks(
@@ -450,15 +454,28 @@ def apply_leave_one_out_cms(
     sum_all = stacked.sum(dim=0)
     m = float(len(shift_keys))
 
+    def _debias(
+        vec: torch.Tensor, mean_shift: torch.Tensor, m_eff: float
+    ) -> torch.Tensor:
+        r = torch.norm(mean_shift, dim=-1, keepdim=True)
+        mu_hat = mean_shift / torch.clamp(r, min=1e-12)
+        r0 = 1.0 / max(float(np.sqrt(max(m_eff, 1.0))), 1.0)
+        excess = torch.clamp((r - 0.5 * r0) / max(1.0 - 0.5 * r0, 1e-6), 0.0, 1.0)
+        proj_coeff = torch.clamp(
+            (vec * mu_hat).sum(dim=-1, keepdim=True), min=0.0
+        )
+        updated = vec - float(eta) * (
+            0.5 * mean_shift + 0.5 * excess * proj_coeff * mu_hat
+        )
+        return F.normalize(updated, dim=-1, eps=1e-12)
+
     mean_all = sum_all / m
-    debiased_clean = F.normalize(
-        clean_norm - float(eta) * mean_all, dim=-1, eps=1e-12
-    )
+    debiased_clean = _debias(clean_norm, mean_all, m)
     debiased_shifted: dict[float, torch.Tensor] = {}
     for k in shift_keys:
         mean_other = (sum_all - shifted_norm[k]) / max(m - 1.0, 1.0)
-        debiased_shifted[k] = F.normalize(
-            shifted_norm[k] - float(eta) * mean_other, dim=-1, eps=1e-12
+        debiased_shifted[k] = _debias(
+            shifted_norm[k], mean_other, max(m - 1.0, 1.0)
         )
     return debiased_clean, debiased_shifted
 

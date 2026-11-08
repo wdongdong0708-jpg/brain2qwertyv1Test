@@ -326,6 +326,10 @@ def test_verify_word_shortcut_training_pipeline_end_to_end():
     vocab_words, bank = load_or_compute_bge_m3_embeddings(
         words["text"].tolist(), [], backend="hash", embedding_dim=32
     )
+    assert np.linalg.norm(bank.mean(axis=0)) < 0.15
+    np.testing.assert_allclose(
+        np.linalg.norm(bank, axis=-1), np.ones(len(vocab_words)), atol=1e-5
+    )
     vb = build_vocabulary_banks(words, vocab_words, top_k_50=50)
     w2i = vb["word_to_idx"]
 
@@ -467,6 +471,10 @@ def test_zero_init_gated_rolling_monotonic_and_premotor_latency():
     )
     vocab_words, bank = load_or_compute_bge_m3_embeddings(
         words["text"].tolist(), [], backend="hash", embedding_dim=32
+    )
+    assert np.linalg.norm(bank.mean(axis=0)) < 0.15
+    np.testing.assert_allclose(
+        np.linalg.norm(bank, axis=-1), np.ones(len(vocab_words)), atol=1e-5
     )
     vb = build_vocabulary_banks(words, vocab_words, top_k_50=50)
     w2i = vb["word_to_idx"]
