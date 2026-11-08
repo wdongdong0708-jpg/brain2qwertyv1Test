@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "aoci": {
+      "command": "C:/Users/Administrator/Desktop/aoci_0.1.0-rc21_windows_amd64/aoci.exe",
+      "args": [
+        "--repo",
+        "C:/Users/Administrator/Desktop/brain2qwertyv1Test",
+        "mcp"
+      ]
+    }
+  }
+}

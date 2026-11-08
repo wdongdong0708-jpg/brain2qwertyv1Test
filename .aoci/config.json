@@ -1,0 +1,457 @@
+{
+  "version": 2,
+  "locale": "zh-CN",
+  "index_path": "aoci.txt",
+  "exclude_dirs": [
+    "node_modules",
+    ".next",
+    ".output",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    "htmlcov"
+  ],
+  "exclude_root_dirs": [
+    "backup",
+    "backups",
+    "build",
+    "cache",
+    "coverage",
+    "dist",
+    "target",
+    "tmp",
+    "uploads",
+    "artifacts",
+    "vendor"
+  ],
+  "exclude_files": [
+    "*.backup.*",
+    "*.bak",
+    ".coverage"
+  ],
+  "exclude_exts": [],
+  "curation_exclude": [],
+  "hook_strict": false,
+  "ledger_enabled": true,
+  "line_ending_tolerance": true,
+  "cognition_refresh_threshold": 30,
+  "overview_delivery": {
+    "chunk_tokens": 20000
+  },
+  "managed_scope": {
+    "version": "managed-scope-policy/v2",
+    "profile": "production",
+    "observe_change_policy": "informational",
+    "approval_mode": "inherit",
+    "approval_thresholds": {
+      "entry_removal_count": 25,
+      "entry_removal_percent": 25
+    },
+    "rules": [
+      {
+        "rule_id": "starter-vendored-static-libs",
+        "action": "observe",
+        "pattern": "**/static/**/libs/**",
+        "pattern_kind": "glob",
+        "reason": "vendored static assets and generated bundles are observed, not indexed; delete this rule before the first scan if the path holds your own code",
+        "source": "builtin",
+        "created_by": "aoci-init",
+        "order": 100,
+        "enabled": true
+      },
+      {
+        "rule_id": "starter-vendored-static-lib",
+        "action": "observe",
+        "pattern": "**/static/**/lib/**",
+        "pattern_kind": "glob",
+        "reason": "vendored static assets and generated bundles are observed, not indexed; delete this rule before the first scan if the path holds your own code",
+        "source": "builtin",
+        "created_by": "aoci-init",
+        "order": 101,
+        "enabled": true
+      },
+      {
+        "rule_id": "starter-vendored-static-plugins",
+        "action": "observe",
+        "pattern": "**/static/**/plugins/**",
+        "pattern_kind": "glob",
+        "reason": "vendored static assets and generated bundles are observed, not indexed; delete this rule before the first scan if the path holds your own code",
+        "source": "builtin",
+        "created_by": "aoci-init",
+        "order": 102,
+        "enabled": true
+      },
+      {
+        "rule_id": "starter-vendored-min-js",
+        "action": "observe",
+        "pattern": "**/*.min.js",
+        "pattern_kind": "glob",
+        "reason": "vendored static assets and generated bundles are observed, not indexed; delete this rule before the first scan if the path holds your own code",
+        "source": "builtin",
+        "created_by": "aoci-init",
+        "order": 103,
+        "enabled": true
+      },
+      {
+        "rule_id": "starter-vendored-min-css",
+        "action": "observe",
+        "pattern": "**/*.min.css",
+        "pattern_kind": "glob",
+        "reason": "vendored static assets and generated bundles are observed, not indexed; delete this rule before the first scan if the path holds your own code",
+        "source": "builtin",
+        "created_by": "aoci-init",
+        "order": 104,
+        "enabled": true
+      },
+      {
+        "rule_id": "starter-vendored-source-map",
+        "action": "observe",
+        "pattern": "**/*.map",
+        "pattern_kind": "glob",
+        "reason": "vendored static assets and generated bundles are observed, not indexed; delete this rule before the first scan if the path holds your own code",
+        "source": "builtin",
+        "created_by": "aoci-init",
+        "order": 105,
+        "enabled": true
+      },
+      {
+        "rule_id": "starter-vendored-fonts",
+        "action": "observe",
+        "pattern": "**/fonts/**",
+        "pattern_kind": "glob",
+        "reason": "vendored static assets and generated bundles are observed, not indexed; delete this rule before the first scan if the path holds your own code",
+        "source": "builtin",
+        "created_by": "aoci-init",
+        "order": 106,
+        "enabled": true
+      },
+      {
+        "rule_id": "exclude-data",
+        "action": "exclude",
+        "pattern": "data/**",
+        "pattern_kind": "glob",
+        "reason": "large dataset files",
+        "source": "user",
+        "created_by": "human",
+        "order": 10,
+        "enabled": true
+      },
+      {
+        "rule_id": "exclude-workspace",
+        "action": "exclude",
+        "pattern": "workspace/**",
+        "pattern_kind": "glob",
+        "reason": "local workspace data, caches, and runs",
+        "source": "user",
+        "created_by": "human",
+        "order": 11,
+        "enabled": true
+      },
+      {
+        "rule_id": "exclude-outputs",
+        "action": "exclude",
+        "pattern": "outputs/**",
+        "pattern_kind": "glob",
+        "reason": "legacy and local experiment outputs",
+        "source": "user",
+        "created_by": "human",
+        "order": 12,
+        "enabled": true
+      },
+      {
+        "rule_id": "exclude-results",
+        "action": "exclude",
+        "pattern": "results/**",
+        "pattern_kind": "glob",
+        "reason": "experiment results and checkpoints",
+        "source": "user",
+        "created_by": "human",
+        "order": 13,
+        "enabled": true
+      },
+      {
+        "rule_id": "exclude-runs",
+        "action": "exclude",
+        "pattern": "runs/**",
+        "pattern_kind": "glob",
+        "reason": "training runs and logs",
+        "source": "user",
+        "created_by": "human",
+        "order": 14,
+        "enabled": true
+      },
+      {
+        "rule_id": "exclude-cache",
+        "action": "exclude",
+        "pattern": "cache/**",
+        "pattern_kind": "glob",
+        "reason": "feature and timeline caches",
+        "source": "user",
+        "created_by": "human",
+        "order": 15,
+        "enabled": true
+      },
+      {
+        "rule_id": "exclude-csv",
+        "action": "exclude",
+        "pattern": "**/*.csv",
+        "pattern_kind": "glob",
+        "reason": "tabular outputs and prediction CSVs",
+        "source": "user",
+        "created_by": "human",
+        "order": 16,
+        "enabled": true
+      },
+      {
+        "rule_id": "exclude-media-resources",
+        "action": "exclude",
+        "pattern": "**/resources/**",
+        "pattern_kind": "glob",
+        "reason": "static images and GIFs",
+        "source": "user",
+        "created_by": "human",
+        "order": 17,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-configs",
+        "action": "observe",
+        "pattern": "**/config/**",
+        "pattern_kind": "glob",
+        "reason": "read model and experiment configs on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 20,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-notebooks",
+        "action": "observe",
+        "pattern": "notebooks/**",
+        "pattern_kind": "glob",
+        "reason": "generated Colab notebooks (source of truth is tools/build_colab_notebook.py)",
+        "source": "user",
+        "created_by": "human",
+        "order": 21,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-docs",
+        "action": "observe",
+        "pattern": "docs/**",
+        "pattern_kind": "glob",
+        "reason": "validation reports read on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 22,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-github",
+        "action": "observe",
+        "pattern": ".github/**",
+        "pattern_kind": "glob",
+        "reason": "CI and issue templates read on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 23,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-setup",
+        "action": "observe",
+        "pattern": ".setup/**",
+        "pattern_kind": "glob",
+        "reason": "upstream provenance manifest",
+        "source": "user",
+        "created_by": "human",
+        "order": 24,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-pyproject",
+        "action": "observe",
+        "pattern": "pyproject.toml",
+        "pattern_kind": "file",
+        "reason": "project dependency manifest read on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 25,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-requirements",
+        "action": "observe",
+        "pattern": "requirements-v1-colab.txt",
+        "pattern_kind": "file",
+        "reason": "colab requirements manifest read on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 26,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-gitignore",
+        "action": "observe",
+        "pattern": ".gitignore",
+        "pattern_kind": "file",
+        "reason": "git ignore rules read on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 27,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-gitattributes",
+        "action": "observe",
+        "pattern": ".gitattributes",
+        "pattern_kind": "file",
+        "reason": "git attributes read on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 28,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-code-of-conduct",
+        "action": "observe",
+        "pattern": "CODE_OF_CONDUCT.md",
+        "pattern_kind": "file",
+        "reason": "community boilerplate",
+        "source": "user",
+        "created_by": "human",
+        "order": 29,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-contributing",
+        "action": "observe",
+        "pattern": "CONTRIBUTING.md",
+        "pattern_kind": "file",
+        "reason": "community boilerplate",
+        "source": "user",
+        "created_by": "human",
+        "order": 30,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-license",
+        "action": "observe",
+        "pattern": "LICENSE",
+        "pattern_kind": "file",
+        "reason": "license text",
+        "source": "user",
+        "created_by": "human",
+        "order": 31,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-markdown",
+        "action": "observe",
+        "pattern": "**/*.md",
+        "pattern_kind": "glob",
+        "reason": "markdown documentation read on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 32,
+        "enabled": true
+      },
+      {
+        "rule_id": "observe-mcp-json",
+        "action": "observe",
+        "pattern": ".mcp.json",
+        "pattern_kind": "file",
+        "reason": "agent mcp config read on demand",
+        "source": "user",
+        "created_by": "human",
+        "order": 33,
+        "enabled": true
+      }
+    ]
+  },
+  "cognition_budget": {
+    "version": "cognition-budget-policy/v1",
+    "mode": "enforce",
+    "whole_index": {
+      "target_tokens": 200000,
+      "warning_tokens": 300000,
+      "max_tokens": 400000
+    },
+    "r": [
+      {
+        "min_c": 1,
+        "max_c": 4,
+        "target_tokens": 25,
+        "max_tokens": 50
+      },
+      {
+        "min_c": 5,
+        "max_c": 7,
+        "target_tokens": 45,
+        "max_tokens": 90
+      },
+      {
+        "min_c": 8,
+        "max_c": 8,
+        "target_tokens": 70,
+        "max_tokens": 140
+      },
+      {
+        "min_c": 9,
+        "max_c": 9,
+        "target_tokens": 90,
+        "max_tokens": 180
+      }
+    ],
+    "s": [
+      {
+        "min_c": 1,
+        "max_c": 4,
+        "target_tokens": 20,
+        "max_tokens": 40
+      },
+      {
+        "min_c": 5,
+        "max_c": 7,
+        "target_tokens": 40,
+        "max_tokens": 80
+      },
+      {
+        "min_c": 8,
+        "max_c": 8,
+        "target_tokens": 70,
+        "max_tokens": 140
+      },
+      {
+        "min_c": 9,
+        "max_c": 9,
+        "target_tokens": 100,
+        "max_tokens": 200
+      }
+    ]
+  },
+  "installed_agents": [
+    "claude",
+    "codex"
+  ],
+  "automation": {
+    "mode": "auto"
+  },
+  "ai": {
+    "enabled": false,
+    "provider": "openai-compatible",
+    "base_url": "",
+    "model": "",
+    "api_key_env": "",
+    "timeout_seconds": 0,
+    "max_concurrency": 0,
+    "max_input_tokens": 0,
+    "token_accounting": "auto",
+    "prompt_snapshot": "redacted"
+  }
+}
