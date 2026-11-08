@@ -387,6 +387,8 @@ def test_verify_word_shortcut_training_pipeline_end_to_end():
             s1_embs, bundle.sentence_uids, horizons=(0, 1, 2), history_radius=2
         )
     assert set(r_out.keys()) == {0, 1, 2}
+    assert not torch.allclose(r_out[0], r_out[1], atol=1e-5)
+    assert not torch.allclose(r_out[1], r_out[2], atol=1e-5)
 
     # Experiment 2: Space-Chunked [tau_i, tau_{i+1}] (Isolated, Channel-A, Channel-B, v2-Full, Debiased)
     exp2_iso = SpaceChunkedV2Model(
@@ -498,6 +500,27 @@ def test_zero_init_gated_rolling_monotonic_and_premotor_latency():
     torch.testing.assert_close(ctx0, z, atol=1e-6, rtol=1e-5)
     for r in (0, 1, 2):
         torch.testing.assert_close(roll0[r], z, atol=1e-6, rtol=1e-5)
+
+    # Verify non-zero Step-1 gradients on rolling_out_proj and rolling_unmix_proj (no saddle point)
+    target_vecs = torch.nn.functional.normalize(torch.randn(len(words), 32), dim=-1)
+    crit = DuplicateAwareSigLipLoss()
+    for r in (0, 1, 2):
+        wc_gated.zero_grad(set_to_none=True)
+        out_r = wc_gated.forward_rolling_from_embeddings(z, suids, horizons=(r,))[r]
+        loss_r = crit(out_r, target_vecs)
+        loss_r.backward()
+        assert wc_gated.rolling_out_proj[str(r)].weight.grad.abs().max().item() > 0.0
+        assert wc_gated.rolling_unmix_proj[str(r)].weight.grad.abs().max().item() > 0.0
+
+    # Verify LOO-CMS never flips vector sign even when all M shifts are 99% collinear with clean (Exp2)
+    collinear_shifts = {
+        s: torch.nn.functional.normalize(z + 0.05 * torch.randn_like(z), dim=-1)
+        for s in DEFAULT_SHIFT_SECONDS
+    }
+    deb_c, deb_s = apply_leave_one_out_cms(z, collinear_shifts, eta=0.50)
+    assert ((deb_c * z).sum(dim=-1) > 0.5).all()
+    for s in DEFAULT_SHIFT_SECONDS:
+        assert ((deb_s[s] * collinear_shifts[s]).sum(dim=-1) > 0.5).all()
 
     # Verify pre-motor window [-0.25s, +0.25s] cuts K0 post-onset wait in half vs [+0.00s, +0.50s]
     onsets = words["start"].to_numpy(dtype=np.float64)

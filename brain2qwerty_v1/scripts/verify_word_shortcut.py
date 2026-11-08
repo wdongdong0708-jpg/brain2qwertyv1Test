@@ -719,8 +719,11 @@ def train_frozen_context_transformer(
 
     bank_t = torch.from_numpy(embedding_bank).to(device)
     val_targets_cpu = torch.from_numpy(embedding_bank[val_bundle.word_indices]).float()
+    val_targets_dev = val_targets_cpu.to(device)
 
-    def _val_tuple(val_preds_cpu: torch.Tensor) -> tuple[float, float, float]:
+    def _val_tuple(
+        val_preds_cpu: torch.Tensor, val_loss_float: float = 0.0
+    ) -> tuple[float, float, float, float]:
         metrics = evaluate_word_retrieval(
             val_preds_cpu,
             val_bundle.word_indices,
@@ -731,9 +734,21 @@ def train_frozen_context_transformer(
         )
         p_norm = torch.nn.functional.normalize(val_preds_cpu.float(), dim=-1, eps=1e-12)
         cos_sim = float((p_norm * val_targets_cpu).sum(dim=-1).mean())
+        v50_macro = float(metrics["vocab50"]["macro_top10"])
+        v50_func = float(metrics["vocab50"]["function_top10"])
+        v50_cont = float(metrics["vocab50"]["content_top10"])
+        fv_macro = float(metrics["full_vocab"]["macro_top10"])
+        composite = (
+            0.50 * v50_macro
+            + 0.25 * (v50_func + v50_cont)
+            + 0.25 * fv_macro
+            + 60.0 * cos_sim
+            - 4.0 * float(val_loss_float)
+        )
         return (
-            round(float(metrics["vocab50"]["macro_top10"]), 4),
-            round(float(metrics["full_vocab"]["macro_top10"]), 4),
+            round(composite, 4),
+            round(v50_macro, 4),
+            round(fv_macro, 4),
             round(cos_sim, 6),
         )
 
@@ -746,17 +761,12 @@ def train_frozen_context_transformer(
         ]
         optimizer = torch.optim.AdamW(
             [
-                {"params": base_params, "lr": lr, "weight_decay": 1e-3},
-                {"params": gate_params, "lr": lr * 6.0, "weight_decay": 0.0},
+                {"params": base_params, "lr": lr * 0.5, "weight_decay": 1e-3},
+                {"params": gate_params, "lr": lr * 2.0, "weight_decay": 0.0},
                 {"params": list(criterion.parameters()), "lr": lr, "weight_decay": 0.0},
             ]
         )
-        model.eval()
-        with torch.no_grad():
-            init_preds = model.forward_context_from_embeddings(
-                val_stage1_embs.to(device), val_bundle.sentence_uids
-            ).cpu()
-        best_val = _val_tuple(init_preds)
+        best_val: tuple[float, float, float, float] | None = None
         best_state = copy.deepcopy(model.state_dict())
 
         for _ in range(max(int(epochs), 1)):
@@ -774,13 +784,8 @@ def train_frozen_context_transformer(
                     torch.from_numpy(train_bundle.word_indices[rows]).long().to(device)
                 ]
                 optimizer.zero_grad(set_to_none=True)
-                preds, raw_delta = model.forward_context_from_embeddings(
-                    w_emb, suids, return_raw_delta=True
-                )
-                aux_preds = torch.nn.functional.normalize(
-                    w_emb + 0.25 * raw_delta, dim=-1, eps=1e-12
-                )
-                loss = criterion(preds, targets) + 0.35 * criterion(aux_preds, targets)
+                preds = model.forward_context_from_embeddings(w_emb, suids)
+                loss = criterion(preds, targets)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     [*base_params, *gate_params], 1.0
@@ -789,11 +794,13 @@ def train_frozen_context_transformer(
 
             model.eval()
             with torch.no_grad():
-                val_preds = model.forward_context_from_embeddings(
+                val_preds_dev = model.forward_context_from_embeddings(
                     val_stage1_embs.to(device), val_bundle.sentence_uids
-                ).cpu()
-                score = _val_tuple(val_preds)
-                if score >= best_val:
+                )
+                val_loss_v = float(criterion(val_preds_dev, val_targets_dev).detach().cpu())
+                val_preds = val_preds_dev.cpu()
+                score = _val_tuple(val_preds, val_loss_v)
+                if best_val is None or score >= best_val:
                     best_val = score
                     best_state = copy.deepcopy(model.state_dict())
 
@@ -812,6 +819,8 @@ def train_frozen_context_transformer(
             model.rolling_transformers[r_key],
             model.rolling_out_proj[r_key],
             model.rolling_unmix_proj[r_key],
+            model.gate_proj[r_key],
+            model.phase_proj[r_key],
         ]
         for mod in stage_modules:
             for p in mod.parameters():
@@ -821,7 +830,11 @@ def train_frozen_context_transformer(
         model.rolling_alpha[r_key].requires_grad_(True)
         model.phase_alpha[r_key].requires_grad_(True)
 
-        gate_params = [model.rolling_alpha[r_key], model.phase_alpha[r_key]]
+        gate_params = [
+            model.rolling_alpha[r_key],
+            model.phase_alpha[r_key],
+            *model.gate_proj[r_key].parameters(),
+        ]
         gate_ids = {id(p) for p in gate_params}
         base_params = [
             p for p in model.parameters() if p.requires_grad and id(p) not in gate_ids
@@ -829,24 +842,15 @@ def train_frozen_context_transformer(
         criterion = DuplicateAwareSigLipLoss().to(device)
         optimizer = torch.optim.AdamW(
             [
-                {"params": base_params, "lr": lr, "weight_decay": 1e-3},
-                {"params": gate_params, "lr": lr * 8.0, "weight_decay": 0.0},
+                {"params": base_params, "lr": lr * 0.5, "weight_decay": 1e-3},
+                {"params": gate_params, "lr": lr * 2.0, "weight_decay": 0.0},
                 {"params": list(criterion.parameters()), "lr": lr, "weight_decay": 0.0},
             ]
         )
 
-        model.eval()
-        with torch.no_grad():
-            val_w = val_stage1_embs.to(device)
-            val_lag = val_lag_embs.to(device) if val_lag_embs is not None else None
-            init_r_preds = model.forward_rolling_from_embeddings(
-                val_w,
-                val_bundle.sentence_uids,
-                horizons=(r_stage,),
-                history_radius=2,
-                lag_embeddings=val_lag,
-            )[r_stage].cpu()
-        best_stage_val = _val_tuple(init_r_preds)
+        val_w = val_stage1_embs.to(device)
+        val_lag = val_lag_embs.to(device) if val_lag_embs is not None else None
+        best_stage_val: tuple[float, float, float, float] | None = None
         best_stage_state = copy.deepcopy(model.state_dict())
 
         for _ in range(stage_epochs):
@@ -869,20 +873,14 @@ def train_frozen_context_transformer(
                     torch.from_numpy(train_bundle.word_indices[rows]).long().to(device)
                 ]
                 optimizer.zero_grad(set_to_none=True)
-                views, deltas = model.forward_rolling_from_embeddings(
+                views = model.forward_rolling_from_embeddings(
                     w_emb,
                     suids,
                     horizons=(r_stage,),
                     history_radius=2,
                     lag_embeddings=lag_b,
-                    return_raw_deltas=True,
                 )
-                aux_preds = torch.nn.functional.normalize(
-                    w_emb + 0.25 * deltas[r_stage], dim=-1, eps=1e-12
-                )
-                loss = criterion(views[r_stage], targets) + 0.40 * criterion(
-                    aux_preds, targets
-                )
+                loss = criterion(views[r_stage], targets)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(
                     [*base_params, *gate_params], 1.0
@@ -891,25 +889,30 @@ def train_frozen_context_transformer(
 
             model.eval()
             with torch.no_grad():
-                val_preds = model.forward_rolling_from_embeddings(
+                val_preds_dev = model.forward_rolling_from_embeddings(
                     val_w,
                     val_bundle.sentence_uids,
                     horizons=(r_stage,),
                     history_radius=2,
                     lag_embeddings=val_lag,
-                )[r_stage].cpu()
-                score = _val_tuple(val_preds)
-                if score >= best_stage_val:
+                )[r_stage]
+                val_loss_v = float(criterion(val_preds_dev, val_targets_dev).detach().cpu())
+                val_preds = val_preds_dev.cpu()
+                score = _val_tuple(val_preds, val_loss_v)
+                if best_stage_val is None or score >= best_stage_val:
                     best_stage_val = score
                     best_stage_state = copy.deepcopy(model.state_dict())
 
+        # Load best state strictly ONCE after all stage_epochs complete
         model.load_state_dict(best_stage_state)
-        print(
-            f"[{label} | K{r_stage}] best_val_v50={best_stage_val[0]:.2f}% | "
-            f"full_vocab={best_stage_val[1]:.2f}% | cos={best_stage_val[2]:.4f} | "
-            f"alpha={float(torch.tanh(model.rolling_alpha[r_key]).detach().cpu()):+.3f}",
-            flush=True,
-        )
+        if best_stage_val is not None:
+            print(
+                f"[{label} | K{r_stage}] composite={best_stage_val[0]:.2f} | "
+                f"val_v50={best_stage_val[1]:.2f}% | full_vocab={best_stage_val[2]:.2f}% | "
+                f"cos={best_stage_val[3]:.4f} | "
+                f"alpha={float(torch.tanh(model.rolling_alpha[r_key]).detach().cpu()):+.3f}",
+                flush=True,
+            )
 
     model.eval()
     return model
@@ -1222,6 +1225,7 @@ def format_markdown_report(
                 f"## 4. 实验二：模拟 Brain2Qwerty v2 空格边界切分模式（Space-Chunked `[τ_i, τ_{{i+1}}]`, Shifts: `{', '.join(f'{s:+.0f}s' for s in shifts)}`）",
                 "- **通道 A (`Channel-A`)**: 变长空格切块帧数 `L_i = round(Δτ_i · f_s)` 直接暴露打字时长/词长",
                 "- **通道 B (`Channel-B`)**: 底层连续 `Conv + Conformer` 跨空格边界感受野在切块前混合时间网格（即便块内采用严格均值池化 `Mean-Pool`）",
+                "- **去偏机制对比**: 变长切块模型的表征本身与词长 `Δτ_i` 锁死，仅能扣除跨平移锚点的纯背景脑磁均值（若强行扣除词长主成分会连同主表征一起破坏），反衬出实验一固定预运动窗口 `[-0.25s, +0.25s]` 从源头切断长度捷径的必要性",
                 "",
                 *_render_table(exp2_rows),
                 "",

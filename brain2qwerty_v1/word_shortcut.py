@@ -431,11 +431,11 @@ def apply_leave_one_out_cms(
     shifted_predictions: dict[float, torch.Tensor],
     eta: float = 0.50,
 ) -> tuple[torch.Tensor, dict[float, torch.Tensor]]:
-    """Leave-One-Out Common-Mode Subtraction (LOO-CMS) on unit-normalized predictions.
+    """Leave-One-Out Common-Mode Subtraction (LOO-CMS) across historical shifts.
 
-    - Clean (0s) subtracts the mean and adaptive common-mode projection of all M shifted predictions.
-    - Each Shifted (delta_k) subtracts only the mean and common-mode projection of the other M-1
-      shifted predictions, guaranteeing zero self-subtraction leakage on the negative control.
+    - Clean (0s) subtracts eta * mean of all M shifted predictions at the same duration grid.
+    - Each Shifted (delta_k) subtracts eta * mean of the other M-1 shifted predictions,
+      guaranteeing zero self-subtraction leakage and never flipping vector sign along the common mode.
     """
     clean_norm = F.normalize(clean_predictions.float(), dim=-1, eps=1e-12)
     shift_keys = sorted(shifted_predictions.keys())
@@ -450,23 +450,16 @@ def apply_leave_one_out_cms(
     sum_all = stacked.sum(dim=0)
     m = float(len(shift_keys))
 
-    def _debias(vec: torch.Tensor, mean_shift: torch.Tensor, m_eff: float) -> torch.Tensor:
-        r = torch.norm(mean_shift, dim=-1, keepdim=True)
-        mu_hat = mean_shift / torch.clamp(r, min=1e-12)
-        r0 = 1.0 / max(float(np.sqrt(max(m_eff, 1.0))), 1.0)
-        excess = torch.clamp((r - 0.5 * r0) / max(1.0 - 0.5 * r0, 1e-6), 0.0, 1.0)
-        proj_coeff = torch.clamp(
-            (vec * mu_hat).sum(dim=-1, keepdim=True), min=0.0
-        )
-        updated = vec - float(eta) * mean_shift - excess * proj_coeff * mu_hat
-        return F.normalize(updated, dim=-1, eps=1e-12)
-
     mean_all = sum_all / m
-    debiased_clean = _debias(clean_norm, mean_all, m)
+    debiased_clean = F.normalize(
+        clean_norm - float(eta) * mean_all, dim=-1, eps=1e-12
+    )
     debiased_shifted: dict[float, torch.Tensor] = {}
     for k in shift_keys:
         mean_other = (sum_all - shifted_norm[k]) / max(m - 1.0, 1.0)
-        debiased_shifted[k] = _debias(shifted_norm[k], mean_other, max(m - 1.0, 1.0))
+        debiased_shifted[k] = F.normalize(
+            shifted_norm[k] - float(eta) * mean_other, dim=-1, eps=1e-12
+        )
     return debiased_clean, debiased_shifted
 
 
@@ -818,13 +811,13 @@ class WordContextModel(nn.Module):
             self.out_proj = nn.Linear(
                 transformer_dim, embedding_dim, bias=not self.gated_residual
             )
-            self.context_alpha = nn.Parameter(torch.zeros(1))
+            if self.gated_residual:
+                nn.init.zeros_(self.out_proj.weight)
+            self.context_alpha = nn.Parameter(torch.full((1,), 0.25))
+            # Plain Linear without LayerNorm so neighbor sin(theta) norm attenuation is preserved
             self.rolling_in_proj = nn.ModuleDict(
                 {
-                    str(r): nn.Sequential(
-                        nn.LayerNorm(embedding_dim),
-                        nn.Linear(embedding_dim, transformer_dim, bias=False),
-                    )
+                    str(r): nn.Linear(embedding_dim, transformer_dim, bias=False)
                     for r in (0, 1, 2)
                 }
             )
@@ -838,7 +831,7 @@ class WordContextModel(nn.Module):
                             dropout=0.1,
                             activation="gelu",
                             batch_first=True,
-                            norm_first=True,
+                            norm_first=False,
                         ),
                         num_layers=max(1, transformer_depth - 1),
                         enable_nested_tensor=False,
@@ -846,11 +839,24 @@ class WordContextModel(nn.Module):
                     for r in (0, 1, 2)
                 }
             )
+            # Non-zero alpha_r with zero-initialized projection weights breaks the (alpha=0, W=0) saddle point
             self.rolling_alpha = nn.ParameterDict(
-                {str(r): nn.Parameter(torch.zeros(1)) for r in (0, 1, 2)}
+                {str(r): nn.Parameter(torch.full((1,), 0.25)) for r in (0, 1, 2)}
             )
             self.phase_alpha = nn.ParameterDict(
-                {str(r): nn.Parameter(torch.zeros(1)) for r in (0, 1, 2)}
+                {str(r): nn.Parameter(torch.full((1,), 0.20)) for r in (0, 1, 2)}
+            )
+            self.gate_proj = nn.ModuleDict(
+                {
+                    str(r): nn.Linear(embedding_dim, 1, bias=True)
+                    for r in (0, 1, 2)
+                }
+            )
+            self.phase_proj = nn.ModuleDict(
+                {
+                    str(r): nn.Linear(embedding_dim, embedding_dim, bias=False)
+                    for r in (0, 1, 2)
+                }
             )
             self.rel_pos_scale = nn.ParameterDict(
                 {
@@ -860,7 +866,7 @@ class WordContextModel(nn.Module):
             )
             self.rel_pos_emb = nn.ParameterDict(
                 {
-                    str(r): nn.Parameter(torch.randn(9, transformer_dim) * 0.02)
+                    str(r): nn.Parameter(torch.zeros(9, transformer_dim))
                     for r in (0, 1, 2)
                 }
             )
@@ -880,6 +886,13 @@ class WordContextModel(nn.Module):
                     for r in (0, 1, 2)
                 }
             )
+            for r in (0, 1, 2):
+                r_key = str(r)
+                nn.init.zeros_(self.rolling_out_proj[r_key].weight)
+                nn.init.zeros_(self.rolling_unmix_proj[r_key].weight)
+                nn.init.zeros_(self.phase_proj[r_key].weight)
+                nn.init.zeros_(self.gate_proj[r_key].weight)
+                nn.init.constant_(self.gate_proj[r_key].bias, 1.0)
         else:
             self.in_proj = None
             self.transformer = None
@@ -889,6 +902,8 @@ class WordContextModel(nn.Module):
             self.rolling_transformers = None
             self.rolling_alpha = None
             self.phase_alpha = None
+            self.gate_proj = None
+            self.phase_proj = None
             self.rel_pos_scale = None
             self.rel_pos_emb = None
             self.rolling_out_proj = None
@@ -931,12 +946,11 @@ class WordContextModel(nn.Module):
         if self.gated_residual and self.context_alpha is not None:
             if len(out) > 1:
                 out = out - out.mean(dim=0, keepdim=True)
-            delta = F.normalize(out, dim=-1, eps=1e-12)
             gate = torch.tanh(self.context_alpha)
-            pred = F.normalize(z + gate * delta, dim=-1, eps=1e-12)
-            return (pred, delta) if return_raw_delta else pred
+            pred = F.normalize(z + gate * out, dim=-1, eps=1e-12)
+            return (pred, out) if return_raw_delta else pred
         pred = F.normalize(out + z, dim=-1, eps=1e-12)
-        return (pred, F.normalize(out, dim=-1, eps=1e-12)) if return_raw_delta else pred
+        return (pred, out) if return_raw_delta else pred
 
     def forward_rolling_from_embeddings(
         self,
@@ -948,7 +962,7 @@ class WordContextModel(nn.Module):
         lag_embeddings: Sequence[torch.Tensor] | None = None,
         return_raw_deltas: bool = False,
     ) -> dict[int, torch.Tensor] | tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
-        """Progressive local-window rolling revision (z -> K0 -> K1 -> K2) with relative position & zero-init residual."""
+        """Progressive local-window rolling revision (z -> K0 -> K1 -> K2) with sin(theta) ortho norm & dynamic gate."""
         z = F.normalize(word_embeddings.float(), dim=-1, eps=1e-12)
         if not self.use_transformer or self.rolling_transformers is None:
             out_dict = {int(r): z for r in horizons}
@@ -982,19 +996,22 @@ class WordContextModel(nn.Module):
         for r_int in range(max_h + 1):
             r_key = str(r_int)
             base_z = prev_state
-            if r_int < len(lag_normed) and self.phase_alpha is not None:
+            if (
+                r_int < len(lag_normed)
+                and self.phase_alpha is not None
+                and self.phase_proj is not None
+            ):
                 p_gate = torch.tanh(self.phase_alpha[r_key])
                 lag_vec = lag_normed[r_int]
-                # Orthogonalize lag phase component against current state or add directly
-                lag_diff = lag_vec - (lag_vec * base_z).sum(dim=-1, keepdim=True) * base_z
-                if n_total > 1:
-                    lag_diff = lag_diff - lag_diff.mean(dim=0, keepdim=True)
-                lag_unit = F.normalize(lag_vec + 0.5 * lag_diff, dim=-1, eps=1e-12)
-                base_z = F.normalize(base_z + p_gate * lag_unit, dim=-1, eps=1e-12)
+                # Preserve natural sin(theta) orthogonal residual without F.normalize noise amplification
+                lag_ortho = lag_vec - (lag_vec * base_z).sum(dim=-1, keepdim=True) * base_z
+                phase_delta = self.phase_proj[r_key](lag_vec + 0.5 * lag_ortho)
             else:
-                lag_unit = torch.zeros_like(base_z)
+                p_gate = z.new_zeros(1)
+                phase_delta = torch.zeros_like(base_z)
 
             col_tensors: list[torch.Tensor] = []
+            sin_thetas: list[torch.Tensor] = []
             scales: list[torch.Tensor] = []
             biases: list[torch.Tensor] = []
             for offset in range(-hist_r, r_int + 1):
@@ -1025,12 +1042,16 @@ class WordContextModel(nn.Module):
                     nbr_idx_t = torch.tensor(nbr_row_idx, dtype=torch.long, device=z.device)
                     nbr_vecs = z[nbr_idx_t]
                     collinear = (nbr_vecs * base_z).sum(dim=-1, keepdim=True) * base_z
-                    ortho_vecs = F.normalize(nbr_vecs - collinear, dim=-1, eps=1e-12)
+                    # Natural sin(theta) norm: overlapping short function words auto-attenuate noise!
+                    ortho_vecs = nbr_vecs - collinear
                     if any(is_self):
                         self_mask = torch.tensor(
                             is_self, dtype=torch.bool, device=z.device
                         ).unsqueeze(-1)
-                        ortho_vecs = torch.where(self_mask, base_z, ortho_vecs)
+                        ortho_vecs = torch.where(self_mask, torch.zeros_like(base_z), ortho_vecs)
+                    sin_thetas.append(
+                        torch.norm(ortho_vecs, dim=-1, keepdim=True).clamp(min=0.0, max=1.0)
+                    )
                     col_tensors.append(ortho_vecs)
 
             windows_emb = torch.stack(col_tensors, dim=1)
@@ -1038,26 +1059,35 @@ class WordContextModel(nn.Module):
             bias_t = torch.stack(biases, dim=0).unsqueeze(0)
             h_win = self.rolling_in_proj[r_key](windows_emb) * scale_t + bias_t
 
-            # No src_key_padding_mask: all width slots are populated, eliminating pos=0 boundary leaks
             ctx = self.rolling_transformers[r_key](h_win)
             attn_delta = self.rolling_out_proj[r_key](ctx[:, hist_r])
             if windows_emb.shape[1] == self.history_radius + r_int + 1:
                 unmix_delta = self.rolling_unmix_proj[r_key](
                     windows_emb.reshape(n_total, -1)
                 )
-                raw_delta = attn_delta + 0.5 * unmix_delta
+                raw_delta = attn_delta + 0.5 * unmix_delta + p_gate * phase_delta
             else:
-                raw_delta = attn_delta
+                raw_delta = attn_delta + p_gate * phase_delta
 
             if n_total > 1:
                 raw_delta = raw_delta - raw_delta.mean(dim=0, keepdim=True)
-            unit_delta = F.normalize(raw_delta + 0.35 * lag_unit, dim=-1, eps=1e-12)
-            gate = torch.tanh(self.rolling_alpha[r_key])
+
+            mean_sin_theta = (
+                torch.stack(sin_thetas, dim=0).mean(dim=0)
+                if sin_thetas
+                else base_z.new_ones((n_total, 1))
+            )
+            subspace_gate = torch.sigmoid(self.gate_proj[r_key](base_z))
+            gate = (
+                (0.35 + 0.65 * mean_sin_theta)
+                * subspace_gate
+                * torch.tanh(self.rolling_alpha[r_key])
+            )
             prev_state = F.normalize(
-                base_z + gate * unit_delta, dim=-1, eps=1e-12
+                base_z + gate * raw_delta, dim=-1, eps=1e-12
             )
             all_results[r_int] = prev_state
-            all_deltas[r_int] = unit_delta
+            all_deltas[r_int] = raw_delta
 
         results = {r: all_results[min(max(r, 0), max_h)] for r in req_horizons}
         raw_deltas = {r: all_deltas[min(max(r, 0), max_h)] for r in req_horizons}
