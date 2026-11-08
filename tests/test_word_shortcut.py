@@ -7,8 +7,11 @@ from brain2qwerty_v1.scripts.verify_word_shortcut import (
     SplitWordBundle,
     _compute_timing_feature_matrix,
     format_markdown_report,
+    predict_space_chunked_model,
     train_frozen_context_transformer,
+    train_frozen_space_chunked_aligner,
     train_neural_word_model,
+    train_space_chunked_v2_model,
     train_timing_only_model,
 )
 from brain2qwerty_v1.transforms import (
@@ -19,6 +22,7 @@ from brain2qwerty_v1.transforms import (
 from brain2qwerty_v1.word_shortcut import (
     DEFAULT_SHIFT_SECONDS,
     DuplicateAwareSigLipLoss,
+    SpaceChunkedV2Model,
     TimingOnlyShortcutModel,
     WordContextModel,
     apply_leave_one_out_cms,
@@ -381,4 +385,36 @@ def test_verify_word_shortcut_training_pipeline_end_to_end():
             s1_embs, bundle.sentence_uids, horizons=(0, 1, 2), history_radius=2
         )
     assert set(r_out.keys()) == {0, 1, 2}
+
+    # Experiment 2: Space-Chunked [tau_i, tau_{i+1}] (Isolated, Channel-A, Channel-B, v2-Full, Debiased)
+    exp2_iso = SpaceChunkedV2Model(
+        in_channels=8, n_subjects=2, hidden_dim=16, embedding_dim=32,
+        continuous_encoder=False, length_aware_pool=False, use_aligner=False,
+    )
+    exp2_iso = train_space_chunked_v2_model(
+        "Exp2-Iso", exp2_iso, bundle, bundle, bank, vb,
+        epochs=2, batch_size=32, lr=1e-3, seed=33, device=device,
+    )
+    iso_embs, _ = predict_space_chunked_model(exp2_iso, bundle, 32, device)
+    assert iso_embs.shape == (len(words), 32)
+
+    exp2_chb = SpaceChunkedV2Model(
+        in_channels=8, n_subjects=2, hidden_dim=16, embedding_dim=32,
+        continuous_encoder=True, length_aware_pool=False, use_aligner=True, aligner_depth=1, aligner_heads=2,
+    )
+    exp2_chb = train_space_chunked_v2_model(
+        "Exp2-ChB", exp2_chb, bundle, bundle, bank, vb,
+        epochs=2, batch_size=32, lr=1e-3, seed=33, device=device,
+    )
+    _, chb_preds = predict_space_chunked_model(exp2_chb, bundle, 32, device)
+    assert chb_preds.shape == (len(words), 32)
+
+    exp2_deb = train_frozen_space_chunked_aligner(
+        exp2_iso, iso_embs, iso_embs, bundle, bundle, bank, vb,
+        epochs=2, batch_size=32, lr=1e-3, seed=33, device=device,
+    )
+    with torch.no_grad():
+        deb_preds = exp2_deb.forward_aligner_from_embeddings(iso_embs, bundle.sentence_uids)
+    assert deb_preds.shape == (len(words), 32)
+
 

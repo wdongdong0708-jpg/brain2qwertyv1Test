@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import argparse
 import copy
-import json
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -13,7 +12,6 @@ import lightning.pytorch as pl
 import numpy as np
 import pandas as pd
 import torch
-from torch.nn import functional as F
 
 import neuralset as ns
 import studies  # noqa: F401
@@ -23,12 +21,14 @@ from ..utils import ChannelPositions2D, select_participants
 from ..word_shortcut import (
     DEFAULT_SHIFT_SECONDS,
     DuplicateAwareSigLipLoss,
+    SpaceChunkedV2Model,
     TimingOnlyShortcutModel,
     WordContextModel,
     apply_leave_one_out_cms,
     audit_word_timing_statistics,
     build_vocabulary_banks,
     compute_shifted_word_onsets,
+    evaluate_word_retrieval,
     load_or_compute_bge_m3_embeddings,
     summarize_clean_vs_shifted,
 )
@@ -67,9 +67,16 @@ def _trigger_attr(segment, key: str, default=None):
     return getattr(segment.trigger, key, default)
 
 
+def _crop_bundle_frames(bundle: SplitWordBundle, n_frames: int) -> SplitWordBundle:
+    n_f = max(2, min(int(n_frames), int(bundle.neuro.shape[-1])))
+    if n_f == bundle.neuro.shape[-1]:
+        return bundle
+    return replace(bundle, neuro=bundle.neuro[:, :, :n_f].contiguous())
+
+
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Brain2Qwerty Word-Level Typing Duration Shortcut Verification (Clean vs. Shifted)"
+        description="Brain2Qwerty Word-Level Typing Duration Shortcut Verification (Exp1 Fixed-Window & Exp2 v2 Space-Chunked)"
     )
     p.add_argument("--modality", choices=["meg", "eeg"], default="meg")
     subjects = p.add_mutually_exclusive_group()
@@ -93,6 +100,13 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--results-root", type=Path)
     p.add_argument("--run-dir", type=Path)
     p.add_argument(
+        "--experiments",
+        nargs="+",
+        choices=["exp1", "exp2", "all"],
+        default=["exp1", "exp2"],
+        help="Run Experiment 1 (fixed window overlap), Experiment 2 (v2 space-chunked [tau_i, tau_{i+1}]), or both",
+    )
+    p.add_argument(
         "--window-offset",
         type=float,
         default=0.0,
@@ -102,7 +116,7 @@ def parser() -> argparse.ArgumentParser:
         "--window-duration",
         type=float,
         default=1.0,
-        help="Word window duration T (seconds), e.g. 1.0 or 0.5",
+        help="Experiment 1 fixed word window duration T (seconds), e.g. 1.0 or 0.5",
     )
     p.add_argument(
         "--shifts",
@@ -421,7 +435,9 @@ def train_timing_only_model(
             rows_t = torch.from_numpy(rows).long()
             feats = train_bundle.timing_features[rows_t].to(device)
             suids = [train_bundle.sentence_uids[i] for i in rows]
-            targets = bank_t[torch.from_numpy(train_bundle.word_indices[rows]).long().to(device)]
+            targets = bank_t[
+                torch.from_numpy(train_bundle.word_indices[rows]).long().to(device)
+            ]
             optimizer.zero_grad(set_to_none=True)
             preds = model(feats, suids)
             loss = criterion(preds, targets)
@@ -434,8 +450,6 @@ def train_timing_only_model(
             val_preds = model(
                 val_bundle.timing_features.to(device), val_bundle.sentence_uids
             )
-            from ..word_shortcut import evaluate_word_retrieval
-
             val_metrics = evaluate_word_retrieval(
                 val_preds,
                 val_bundle.word_indices,
@@ -563,8 +577,6 @@ def train_neural_word_model(
             epoch_losses.append(float(loss.detach().cpu()))
 
         _, val_preds = predict_word_context_model(model, val_bundle, batch_size, device)
-        from ..word_shortcut import evaluate_word_retrieval
-
         val_metrics = evaluate_word_retrieval(
             val_preds,
             val_bundle.word_indices,
@@ -632,7 +644,7 @@ def train_frozen_context_transformer(
     best_state = copy.deepcopy(model.state_dict())
     best_val = -1.0
 
-    for epoch in range(max(int(epochs), 1)):
+    for _ in range(max(int(epochs), 1)):
         model.train()
         model.brain_encoder.eval()
         model.word_proj.eval()
@@ -670,8 +682,191 @@ def train_frozen_context_transformer(
                 val_preds = model.forward_context_from_embeddings(
                     val_w, val_bundle.sentence_uids
                 ).cpu()
-            from ..word_shortcut import evaluate_word_retrieval
+            val_metrics = evaluate_word_retrieval(
+                val_preds,
+                val_bundle.word_indices,
+                val_bundle.is_function_word,
+                embedding_bank,
+                vocab_banks["vocab50_indices"],
+                vocab_banks["full_vocab_indices"],
+            )
+            score = val_metrics["vocab50"]["macro_top10"]
+            if score >= best_val:
+                best_val = score
+                best_state = copy.deepcopy(model.state_dict())
 
+    model.load_state_dict(best_state)
+    model.eval()
+    return model
+
+
+@torch.no_grad()
+def predict_space_chunked_model(
+    model: SpaceChunkedV2Model,
+    bundle: SplitWordBundle,
+    batch_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return both per-chunk word embeddings and post-Aligner embeddings on CPU."""
+    model.eval()
+    batches = build_sentence_batches(bundle.sentence_uids, batch_size, shuffle=False)
+    chunk_embs: list[torch.Tensor] = []
+    out_embs: list[torch.Tensor] = []
+    for rows in batches:
+        rows_t = torch.from_numpy(rows).long()
+        neuro = bundle.neuro[rows_t].to(device)
+        subj = bundle.subject_id[rows_t].to(device)
+        dt = torch.from_numpy(bundle.delta_taus[rows]).float().to(device)
+        suids = [bundle.sentence_uids[i] for i in rows]
+        c_emb = model.encode_space_chunks(neuro, subj, dt, suids)
+        o_emb = model.forward_aligner_from_embeddings(c_emb, suids)
+        chunk_embs.append(c_emb.detach().cpu())
+        out_embs.append(o_emb.detach().cpu())
+    return torch.cat(chunk_embs, dim=0), torch.cat(out_embs, dim=0)
+
+
+def train_space_chunked_v2_model(
+    label: str,
+    model: SpaceChunkedV2Model,
+    train_bundle: SplitWordBundle,
+    val_bundle: SplitWordBundle,
+    embedding_bank: np.ndarray,
+    vocab_banks: dict,
+    *,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    seed: int,
+    device: torch.device,
+) -> SpaceChunkedV2Model:
+    """Train a Brain2Qwerty v2 Space-Chunked ([tau_i, tau_{i+1}]) model variant."""
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    model.to(device)
+    criterion = DuplicateAwareSigLipLoss().to(device)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        [*trainable, *criterion.parameters()], lr=lr, weight_decay=1e-3
+    )
+    bank_t = torch.from_numpy(embedding_bank).to(device)
+    best_state = copy.deepcopy(model.state_dict())
+    best_val = -1.0
+
+    for epoch in range(max(int(epochs), 1)):
+        model.train()
+        batches = build_sentence_batches(
+            train_bundle.sentence_uids, batch_size, shuffle=True, rng=rng
+        )
+        epoch_losses: list[float] = []
+        for rows in batches:
+            rows_t = torch.from_numpy(rows).long()
+            neuro = train_bundle.neuro[rows_t].to(device)
+            subj = train_bundle.subject_id[rows_t].to(device)
+            dt = torch.from_numpy(train_bundle.delta_taus[rows]).float().to(device)
+            suids = [train_bundle.sentence_uids[i] for i in rows]
+            targets = bank_t[
+                torch.from_numpy(train_bundle.word_indices[rows]).long().to(device)
+            ]
+            optimizer.zero_grad(set_to_none=True)
+            preds = model(neuro, subj, dt, suids)
+            loss = criterion(preds, targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            optimizer.step()
+            epoch_losses.append(float(loss.detach().cpu()))
+
+        _, val_preds = predict_space_chunked_model(
+            model, val_bundle, batch_size, device
+        )
+        val_metrics = evaluate_word_retrieval(
+            val_preds,
+            val_bundle.word_indices,
+            val_bundle.is_function_word,
+            embedding_bank,
+            vocab_banks["vocab50_indices"],
+            vocab_banks["full_vocab_indices"],
+        )
+        score = val_metrics["vocab50"]["macro_top10"]
+        if score >= best_val:
+            best_val = score
+            best_state = copy.deepcopy(model.state_dict())
+        if (epoch + 1) % max(1, epochs // 4) == 0 or epoch == epochs - 1:
+            print(
+                f"[{label}] Epoch {epoch + 1}/{epochs} | "
+                f"loss={np.mean(epoch_losses):.4f} | val_v50_top10={score:.2f}%",
+                flush=True,
+            )
+
+    model.load_state_dict(best_state)
+    model.eval()
+    return model
+
+
+def train_frozen_space_chunked_aligner(
+    isolated_model: SpaceChunkedV2Model,
+    train_chunk_embs: torch.Tensor,
+    val_chunk_embs: torch.Tensor,
+    train_bundle: SplitWordBundle,
+    val_bundle: SplitWordBundle,
+    embedding_bank: np.ndarray,
+    vocab_banks: dict,
+    *,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    seed: int,
+    device: torch.device,
+) -> SpaceChunkedV2Model:
+    """Train Cross-Word Aligner on frozen Exp2-1 isolated space-chunked embeddings."""
+    torch.manual_seed(seed)
+    rng = np.random.default_rng(seed)
+    model = SpaceChunkedV2Model(
+        in_channels=isolated_model.in_channels,
+        n_subjects=max(1, isolated_model.subject_emb.num_embeddings - 4),
+        hidden_dim=isolated_model.hidden_dim,
+        embedding_dim=isolated_model.embedding_dim,
+        continuous_encoder=False,
+        length_aware_pool=False,
+        use_aligner=True,
+    ).to(device)
+    model.load_state_dict(isolated_model.state_dict(), strict=False)
+    for name, p in model.named_parameters():
+        if not name.startswith("aligner"):
+            p.requires_grad_(False)
+
+    criterion = DuplicateAwareSigLipLoss().to(device)
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.AdamW(
+        [*trainable, *criterion.parameters()], lr=lr, weight_decay=1e-3
+    )
+    bank_t = torch.from_numpy(embedding_bank).to(device)
+    best_state = copy.deepcopy(model.state_dict())
+    best_val = -1.0
+
+    for _ in range(max(int(epochs), 1)):
+        model.train()
+        batches = build_sentence_batches(
+            train_bundle.sentence_uids, batch_size, shuffle=True, rng=rng
+        )
+        for rows in batches:
+            rows_t = torch.from_numpy(rows).long()
+            c_emb = train_chunk_embs[rows_t].to(device)
+            suids = [train_bundle.sentence_uids[i] for i in rows]
+            targets = bank_t[
+                torch.from_numpy(train_bundle.word_indices[rows]).long().to(device)
+            ]
+            optimizer.zero_grad(set_to_none=True)
+            preds = model.forward_aligner_from_embeddings(c_emb, suids)
+            loss = criterion(preds, targets)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(trainable, 1.0)
+            optimizer.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_preds = model.forward_aligner_from_embeddings(
+                val_chunk_embs.to(device), val_bundle.sentence_uids
+            ).cpu()
             val_metrics = evaluate_word_retrieval(
                 val_preds,
                 val_bundle.word_indices,
@@ -699,7 +894,7 @@ def format_markdown_report(
     timing_audit: dict,
     model_summaries: dict[str, dict],
 ) -> tuple[str, pd.DataFrame]:
-    """Generate a Markdown report and summary DataFrame for Clean vs. Shifted verification."""
+    """Generate a Markdown report and summary DataFrame for Experiment 1 & Experiment 2."""
     rows: list[dict] = []
     for name, summary in model_summaries.items():
         c_v50 = summary["clean"]["vocab50"]
@@ -733,6 +928,27 @@ def format_markdown_report(
     ov_05 = timing_audit["window_overlap_by_duration"].get("T=0.5s", {})
     ov_10 = timing_audit["window_overlap_by_duration"].get("T=1.0s", {})
 
+    exp1_rows = [r for r in rows if not str(r["Model"]).startswith("Exp2")]
+    exp2_rows = [r for r in rows if str(r["Model"]).startswith("Exp2")]
+
+    def _render_table(sub_rows: list[dict]) -> list[str]:
+        t_lines = [
+            "| Model | V50 Clean Top-10 (%) | V50 Shifted Top-10 (%) | Shortcut Over Chance (pp) | **V50 Net Gain (pp)** | V50 Net Top-1 (pp) | Full-Vocab Net Top-10 (pp) | Func Clean/Shift (%) | Content Clean/Shift (%) |",
+            "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        ]
+        for r in sub_rows:
+            t_lines.append(
+                f"| `{r['Model']}` | {r['V50_Clean_Top10 (%)']:.2f} | "
+                f"{r['V50_Shifted_Top10 (%)']:.2f} ± {r['V50_Shifted_Std (%)']:.2f} | "
+                f"{r['Shortcut_Over_Chance (pp)']:+.2f} | "
+                f"**{r['V50_NetGain_Top10 (pp)']:+.2f}** | "
+                f"{r['V50_NetGain_Top1 (pp)']:+.2f} | "
+                f"{r['FullVocab_NetGain_Top10 (pp)']:+.2f} | "
+                f"{r['FuncWord_Clean_Top10 (%)']:.1f} / {r['FuncWord_Shifted_Top10 (%)']:.1f} | "
+                f"{r['ContentWord_Clean_Top10 (%)']:.1f} / {r['ContentWord_Shifted_Top10 (%)']:.1f} |"
+            )
+        return t_lines
+
     lines = [
         f"# Brain2Qwerty Word-Level Duration Shortcut Verification ({modality.upper()})",
         "",
@@ -744,24 +960,28 @@ def format_markdown_report(
         f"- **Adjacent Window Overlap (`T=0.5s`)**: mean = `{100.0 * ov_05.get('mean_overlap_ratio', 0.0):.1f}%` (`{100.0 * ov_05.get('fraction_overlapping_pairs', 0.0):.1f}%` overlapping pairs)",
         f"- **Adjacent Window Overlap (`T=1.0s`)**: mean = `{100.0 * ov_10.get('mean_overlap_ratio', 0.0):.1f}%` (`{100.0 * ov_10.get('fraction_overlapping_pairs', 0.0):.1f}%` overlapping pairs)",
         "",
-        f"## 2. Clean (`0s`) vs. Historical Circular Shift (`{', '.join(f'{s:+.0f}s' for s in shifts)}`) Verification",
-        f"- **Active neural window**: `[{window_offset:+.2f}s, {window_offset + window_duration:+.2f}s]` (`T = {window_duration:.2f}s`), **LOO-CMS `η`**: `{cms_eta:.2f}`",
-        "",
-        "| Model | V50 Clean Top-10 (%) | V50 Shifted Top-10 (%) | Shortcut Over Chance (pp) | **V50 Net Gain (pp)** | V50 Net Top-1 (pp) | Full-Vocab Net Top-10 (pp) | Func Clean/Shift (%) | Content Clean/Shift (%) |",
-        "| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ]
-    for r in rows:
-        lines.append(
-            f"| `{r['Model']}` | {r['V50_Clean_Top10 (%)']:.2f} | "
-            f"{r['V50_Shifted_Top10 (%)']:.2f} ± {r['V50_Shifted_Std (%)']:.2f} | "
-            f"{r['Shortcut_Over_Chance (pp)']:+.2f} | "
-            f"**{r['V50_NetGain_Top10 (pp)']:+.2f}** | "
-            f"{r['V50_NetGain_Top1 (pp)']:+.2f} | "
-            f"{r['FullVocab_NetGain_Top10 (pp)']:+.2f} | "
-            f"{r['FuncWord_Clean_Top10 (%)']:.1f} / {r['FuncWord_Shifted_Top10 (%)']:.1f} | "
-            f"{r['ContentWord_Clean_Top10 (%)']:.1f} / {r['ContentWord_Shifted_Top10 (%)']:.1f} |"
+    if exp1_rows:
+        lines.extend(
+            [
+                f"## 2. 实验一：固定词窗重叠模式（Fixed-Window Overlap, `T = {window_duration:.2f}s`, Shifts: `{', '.join(f'{s:+.0f}s' for s in shifts)}`）",
+                f"- **固定词窗**: `[{window_offset:+.2f}s, {window_offset + window_duration:+.2f}s]`，**LOO-CMS `η`**: `{cms_eta:.2f}`",
+                "",
+                *_render_table(exp1_rows),
+                "",
+            ]
         )
-    lines.append("")
+    if exp2_rows:
+        lines.extend(
+            [
+                f"## 3. 实验二：模拟 Brain2Qwerty v2 空格边界切分模式（Space-Chunked `[τ_i, τ_{{i+1}}]`, Shifts: `{', '.join(f'{s:+.0f}s' for s in shifts)}`）",
+                "- **通道 A (`Channel-A`)**: 变长空格切块帧数 `L_i = round(Δτ_i · f_s)` 直接暴露打字时长/词长",
+                "- **通道 B (`Channel-B`)**: 底层连续 `Conv + Conformer` 跨空格边界感受野在切块前混合时间网格（即便块内采用严格均值池化 `Mean-Pool`）",
+                "",
+                *_render_table(exp2_rows),
+                "",
+            ]
+        )
     return "\n".join(lines), df
 
 
@@ -770,6 +990,10 @@ def main(argv: Sequence[str] | None = None) -> dict:
     args = p.parse_args(argv)
     pl.seed_everything(args.seed, workers=True)
     torch.set_num_threads(max(int(args.cpu_threads), 1))
+
+    exp_set = set(args.experiments)
+    run_exp1 = "all" in exp_set or "exp1" in exp_set
+    run_exp2 = "all" in exp_set or "exp2" in exp_set
 
     run_device = torch.device(
         ("cuda" if torch.cuda.is_available() else "cpu")
@@ -843,10 +1067,18 @@ def main(argv: Sequence[str] | None = None) -> dict:
     configure_cache(xp.data, read_only=args.require_cache)
     signature = cache_signature(xp.data)
     write_json(output_dir / "cache_signature.json", signature)
+
+    slice_duration = (
+        max(float(args.window_duration), 1.4)
+        if run_exp2
+        else float(args.window_duration)
+    )
+    fixed_frames = max(2, int(round(float(args.window_duration) * 50.0)))
+
     print(
         f"Word Shortcut Verification | modality={args.modality} | participants={participants} "
-        f"| timelines={len(summary)} | window=[{args.window_offset:+.2f}s, "
-        f"{args.window_offset + args.window_duration:+.2f}s] | device={run_device}",
+        f"| timelines={len(summary)} | exp1={run_exp1} (T={args.window_duration:.2f}s) "
+        f"| exp2={run_exp2} (Space-Chunked [τ_i, τ_{{i+1}}]) | device={run_device}",
         flush=True,
     )
 
@@ -857,7 +1089,7 @@ def main(argv: Sequence[str] | None = None) -> dict:
         raw_events,
         timeline_bounds,
         window_offset=args.window_offset,
-        window_duration=args.window_duration,
+        window_duration=slice_duration,
         max_sentences_per_split={
             "train": args.max_train_sentences,
             "val": args.max_val_sentences,
@@ -919,49 +1151,54 @@ def main(argv: Sequence[str] | None = None) -> dict:
         extractors["channel_positions"] = channel_positions
 
     print("Slicing Clean (0s) word windows for train/val/test...", flush=True)
-    train_bundle, timing_stats = slice_split_word_bundle(
+    train_raw_bundle, timing_stats = slice_split_word_bundle(
         events,
         extractors,
         "train",
         word_to_idx,
         window_offset=args.window_offset,
-        window_duration=args.window_duration,
+        window_duration=slice_duration,
         batch_size=args.batch_size,
         workers=args.workers,
     )
-    val_bundle, _ = slice_split_word_bundle(
+    val_raw_bundle, _ = slice_split_word_bundle(
         events,
         extractors,
         "val",
         word_to_idx,
         window_offset=args.window_offset,
-        window_duration=args.window_duration,
+        window_duration=slice_duration,
         batch_size=args.batch_size,
         workers=args.workers,
         timing_stats=timing_stats,
     )
-    test_bundle, _ = slice_split_word_bundle(
+    test_raw_bundle, _ = slice_split_word_bundle(
         events,
         extractors,
         "test",
         word_to_idx,
         window_offset=args.window_offset,
-        window_duration=args.window_duration,
+        window_duration=slice_duration,
         batch_size=args.batch_size,
         workers=args.workers,
         timing_stats=timing_stats,
     )
+
+    train_exp1 = _crop_bundle_frames(train_raw_bundle, fixed_frames)
+    val_exp1 = _crop_bundle_frames(val_raw_bundle, fixed_frames)
+    test_exp1 = _crop_bundle_frames(test_raw_bundle, fixed_frames)
+
     print(
-        f"Clean splits ready | train={len(train_bundle.words)} words | "
-        f"val={len(val_bundle.words)} words | test={len(test_bundle.words)} words",
+        f"Clean splits ready | train={len(train_raw_bundle.words)} words | "
+        f"val={len(val_raw_bundle.words)} words | test={len(test_raw_bundle.words)} words",
         flush=True,
     )
 
     # --- Model 0: Timing-Only (delta_tau_i) ---
     print("Training Model 0: Timing-Only (Δτ_i)...", flush=True)
     timing_model = train_timing_only_model(
-        train_bundle,
-        val_bundle,
+        train_raw_bundle,
+        val_raw_bundle,
         embedding_bank,
         vocab_banks,
         epochs=args.timing_epochs,
@@ -972,136 +1209,310 @@ def main(argv: Sequence[str] | None = None) -> dict:
     )
     with torch.no_grad():
         timing_test_preds = timing_model(
-            test_bundle.timing_features.to(run_device), test_bundle.sentence_uids
+            test_raw_bundle.timing_features.to(run_device),
+            test_raw_bundle.sentence_uids,
         ).cpu()
     timing_shifted_preds = {
         float(s): timing_test_preds.clone() for s in args.shifts
     }
 
-    # --- Model 1: Word-Only (Stage 1 CNN) ---
-    n_in = int(train_bundle.neuro.shape[1])
+    n_in = int(train_raw_bundle.neuro.shape[1])
     encoder_dim = int(xp.brain_model_config.hidden)
-    brain_stage1 = xp.brain_model_config.build(
-        n_in_channels=n_in, n_outputs=encoder_dim
-    )
-    word_only_model = WordContextModel(
-        brain_encoder=brain_stage1,
-        encoder_out_dim=encoder_dim,
-        embedding_dim=embedding_bank.shape[1],
-        use_transformer=False,
-    )
-    print("Training Model 1: Word-Only (Stage 1 CNN)...", flush=True)
-    word_only_model = train_neural_word_model(
-        "Word-Only",
-        word_only_model,
-        train_bundle,
-        val_bundle,
-        embedding_bank,
-        vocab_banks,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        seed=args.seed,
-        device=run_device,
-    )
+    exp2_hidden = 128 if args.profile == "small" else 256
 
-    # --- Model 2: Full-Context (Joint, Unfrozen CNN + Sentence Transformer) ---
-    brain_joint = copy.deepcopy(word_only_model.brain_encoder)
-    for p in brain_joint.parameters():
-        p.requires_grad_(True)
-    full_joint_model = WordContextModel(
-        brain_encoder=brain_joint,
-        encoder_out_dim=encoder_dim,
-        embedding_dim=embedding_bank.shape[1],
-        use_transformer=True,
-    )
-    full_joint_model.word_proj.load_state_dict(word_only_model.word_proj.state_dict())
-    for p in full_joint_model.word_proj.parameters():
-        p.requires_grad_(True)
-    print("Training Model 2: Full-Context (Joint, Unfrozen CNN)...", flush=True)
-    full_joint_model = train_neural_word_model(
-        "Full-Context (Joint)",
-        full_joint_model,
-        train_bundle,
-        val_bundle,
-        embedding_bank,
-        vocab_banks,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr * 0.5,
-        seed=args.seed,
-        device=run_device,
-    )
-
-    # Extract frozen Stage-1 word embeddings on Clean train/val/test
-    train_s1_embs, _ = predict_word_context_model(
-        word_only_model, train_bundle, args.batch_size, run_device
-    )
-    val_s1_embs, _ = predict_word_context_model(
-        word_only_model, val_bundle, args.batch_size, run_device
-    )
-    test_s1_clean, _ = predict_word_context_model(
-        word_only_model, test_bundle, args.batch_size, run_device
-    )
-    _, test_joint_clean = predict_word_context_model(
-        full_joint_model, test_bundle, args.batch_size, run_device
-    )
-
-    # --- Model 3: Full-Context (+ Freeze CNN) ---
-    print("Training Model 3: Full-Context (+ Freeze CNN)...", flush=True)
-    frozen_full_model = train_frozen_context_transformer(
-        "Full-Context (+ Freeze CNN)",
-        word_only_model,
-        train_s1_embs,
-        val_s1_embs,
-        train_bundle,
-        val_bundle,
-        embedding_bank,
-        vocab_banks,
-        rolling=False,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        seed=args.seed,
-        device=run_device,
-    )
-
-    # --- Model 4: Rolling-K0/K1/K2 (+ Freeze CNN) ---
-    print("Training Model 4: Rolling-K0/K1/K2 (+ Freeze CNN)...", flush=True)
-    frozen_rolling_model = train_frozen_context_transformer(
-        "Rolling-K0/K1/K2 (+ Freeze CNN)",
-        word_only_model,
-        train_s1_embs,
-        val_s1_embs,
-        train_bundle,
-        val_bundle,
-        embedding_bank,
-        vocab_banks,
-        rolling=True,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr=args.lr,
-        seed=args.seed,
-        device=run_device,
-    )
-
-    with torch.no_grad():
-        test_frozen_full_clean = frozen_full_model.forward_context_from_embeddings(
-            test_s1_clean.to(run_device), test_bundle.sentence_uids
-        ).cpu()
-        rolling_clean_views = frozen_rolling_model.forward_rolling_from_embeddings(
-            test_s1_clean.to(run_device),
-            test_bundle.sentence_uids,
-            horizons=(0, 1, 2),
-            history_radius=2,
+    # --- Experiment 1 Models (Fixed-Window Overlap Mode) ---
+    if run_exp1:
+        brain_stage1 = xp.brain_model_config.build(
+            n_in_channels=n_in, n_outputs=encoder_dim
         )
-        rolling_clean_cpu = {r: v.cpu() for r, v in rolling_clean_views.items()}
+        word_only_model = WordContextModel(
+            brain_encoder=brain_stage1,
+            encoder_out_dim=encoder_dim,
+            embedding_dim=embedding_bank.shape[1],
+            use_transformer=False,
+        )
+        print(
+            f"[Exp1] Training Model 1: Word-Only (Fixed T={args.window_duration:.1f}s)...",
+            flush=True,
+        )
+        word_only_model = train_neural_word_model(
+            "Exp1-Word-Only",
+            word_only_model,
+            train_exp1,
+            val_exp1,
+            embedding_bank,
+            vocab_banks,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            device=run_device,
+        )
+
+        brain_joint = copy.deepcopy(word_only_model.brain_encoder)
+        for p in brain_joint.parameters():
+            p.requires_grad_(True)
+        full_joint_model = WordContextModel(
+            brain_encoder=brain_joint,
+            encoder_out_dim=encoder_dim,
+            embedding_dim=embedding_bank.shape[1],
+            use_transformer=True,
+        )
+        full_joint_model.word_proj.load_state_dict(
+            word_only_model.word_proj.state_dict()
+        )
+        for p in full_joint_model.word_proj.parameters():
+            p.requires_grad_(True)
+        print(
+            f"[Exp1] Training Model 2: Full-Context (Joint, Fixed T={args.window_duration:.1f}s)...",
+            flush=True,
+        )
+        full_joint_model = train_neural_word_model(
+            "Exp1-Full-Context (Joint)",
+            full_joint_model,
+            train_exp1,
+            val_exp1,
+            embedding_bank,
+            vocab_banks,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr * 0.5,
+            seed=args.seed,
+            device=run_device,
+        )
+
+        train_s1_embs, _ = predict_word_context_model(
+            word_only_model, train_exp1, args.batch_size, run_device
+        )
+        val_s1_embs, _ = predict_word_context_model(
+            word_only_model, val_exp1, args.batch_size, run_device
+        )
+        test_s1_clean, _ = predict_word_context_model(
+            word_only_model, test_exp1, args.batch_size, run_device
+        )
+        _, test_joint_clean = predict_word_context_model(
+            full_joint_model, test_exp1, args.batch_size, run_device
+        )
+
+        print(
+            "[Exp1] Training Model 3: Full-Context (+ Freeze CNN)...",
+            flush=True,
+        )
+        frozen_full_model = train_frozen_context_transformer(
+            "Exp1-Full-Context (+ Freeze CNN)",
+            word_only_model,
+            train_s1_embs,
+            val_s1_embs,
+            train_exp1,
+            val_exp1,
+            embedding_bank,
+            vocab_banks,
+            rolling=False,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            device=run_device,
+        )
+
+        print(
+            "[Exp1] Training Model 4: Rolling-K0/K1/K2 (+ Freeze CNN)...",
+            flush=True,
+        )
+        frozen_rolling_model = train_frozen_context_transformer(
+            "Exp1-Rolling-K0/K1/K2 (+ Freeze CNN)",
+            word_only_model,
+            train_s1_embs,
+            val_s1_embs,
+            train_exp1,
+            val_exp1,
+            embedding_bank,
+            vocab_banks,
+            rolling=True,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            device=run_device,
+        )
+
+        with torch.no_grad():
+            test_frozen_full_clean = frozen_full_model.forward_context_from_embeddings(
+                test_s1_clean.to(run_device), test_exp1.sentence_uids
+            ).cpu()
+            rolling_clean_views = frozen_rolling_model.forward_rolling_from_embeddings(
+                test_s1_clean.to(run_device),
+                test_exp1.sentence_uids,
+                horizons=(0, 1, 2),
+                history_radius=2,
+            )
+            rolling_clean_cpu = {r: v.cpu() for r, v in rolling_clean_views.items()}
+
+    # --- Experiment 2 Models (Brain2Qwerty v2 Space-Chunked [tau_i, tau_{i+1}] Mode) ---
+    if run_exp2:
+        print(
+            "[Exp2] Training Exp2-1: Space-Chunked Isolated (Mean-Pool Only, No Channel A/B)...",
+            flush=True,
+        )
+        exp2_iso_model = SpaceChunkedV2Model(
+            in_channels=n_in,
+            n_subjects=participants,
+            hidden_dim=exp2_hidden,
+            embedding_dim=embedding_bank.shape[1],
+            continuous_encoder=False,
+            length_aware_pool=False,
+            use_aligner=False,
+        )
+        exp2_iso_model = train_space_chunked_v2_model(
+            "Exp2-1-Isolated-MeanPool",
+            exp2_iso_model,
+            train_raw_bundle,
+            val_raw_bundle,
+            embedding_bank,
+            vocab_banks,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            device=run_device,
+        )
+
+        print(
+            "[Exp2] Training Exp2-2: Space-Chunked Channel-A (Length-Aware Frame-Count Pool + Aligner)...",
+            flush=True,
+        )
+        exp2_cha_model = SpaceChunkedV2Model(
+            in_channels=n_in,
+            n_subjects=participants,
+            hidden_dim=exp2_hidden,
+            embedding_dim=embedding_bank.shape[1],
+            continuous_encoder=False,
+            length_aware_pool=True,
+            use_aligner=True,
+        )
+        exp2_cha_model = train_space_chunked_v2_model(
+            "Exp2-2-Channel-A (Length-Aware)",
+            exp2_cha_model,
+            train_raw_bundle,
+            val_raw_bundle,
+            embedding_bank,
+            vocab_banks,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            device=run_device,
+        )
+
+        print(
+            "[Exp2] Training Exp2-3: Space-Chunked Channel-B (v2 Continuous Conv+Conformer + Mean-Pool + Aligner)...",
+            flush=True,
+        )
+        exp2_chb_model = SpaceChunkedV2Model(
+            in_channels=n_in,
+            n_subjects=participants,
+            hidden_dim=exp2_hidden,
+            embedding_dim=embedding_bank.shape[1],
+            continuous_encoder=True,
+            length_aware_pool=False,
+            use_aligner=True,
+        )
+        exp2_chb_model = train_space_chunked_v2_model(
+            "Exp2-3-Channel-B (Continuous ConvConformer)",
+            exp2_chb_model,
+            train_raw_bundle,
+            val_raw_bundle,
+            embedding_bank,
+            vocab_banks,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            device=run_device,
+        )
+
+        print(
+            "[Exp2] Training Exp2-4: Space-Chunked v2-Full (Channel A + B Joint)...",
+            flush=True,
+        )
+        exp2_full_model = SpaceChunkedV2Model(
+            in_channels=n_in,
+            n_subjects=participants,
+            hidden_dim=exp2_hidden,
+            embedding_dim=embedding_bank.shape[1],
+            continuous_encoder=True,
+            length_aware_pool=True,
+            use_aligner=True,
+        )
+        exp2_full_model = train_space_chunked_v2_model(
+            "Exp2-4-v2-Full (Channel A+B)",
+            exp2_full_model,
+            train_raw_bundle,
+            val_raw_bundle,
+            embedding_bank,
+            vocab_banks,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            device=run_device,
+        )
+
+        train_iso_embs, _ = predict_space_chunked_model(
+            exp2_iso_model, train_raw_bundle, args.batch_size, run_device
+        )
+        val_iso_embs, _ = predict_space_chunked_model(
+            exp2_iso_model, val_raw_bundle, args.batch_size, run_device
+        )
+        test_iso_clean, _ = predict_space_chunked_model(
+            exp2_iso_model, test_raw_bundle, args.batch_size, run_device
+        )
+        _, test_cha_clean = predict_space_chunked_model(
+            exp2_cha_model, test_raw_bundle, args.batch_size, run_device
+        )
+        _, test_chb_clean = predict_space_chunked_model(
+            exp2_chb_model, test_raw_bundle, args.batch_size, run_device
+        )
+        _, test_v2full_clean = predict_space_chunked_model(
+            exp2_full_model, test_raw_bundle, args.batch_size, run_device
+        )
+
+        print(
+            "[Exp2] Training Exp2-5: Space-Chunked Debiased (+ Freeze Isolated Chunk + Aligner)...",
+            flush=True,
+        )
+        exp2_debiased_model = train_frozen_space_chunked_aligner(
+            exp2_iso_model,
+            train_iso_embs,
+            val_iso_embs,
+            train_raw_bundle,
+            val_raw_bundle,
+            embedding_bank,
+            vocab_banks,
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            lr=args.lr,
+            seed=args.seed,
+            device=run_device,
+        )
+        with torch.no_grad():
+            test_exp2_debiased_clean = (
+                exp2_debiased_model.forward_aligner_from_embeddings(
+                    test_iso_clean.to(run_device), test_raw_bundle.sentence_uids
+                ).cpu()
+            )
 
     # --- Evaluate all M Historical Circular Shifts on Test ---
     s1_shifted_map: dict[float, torch.Tensor] = {}
     joint_shifted_map: dict[float, torch.Tensor] = {}
     frozen_full_shifted_map: dict[float, torch.Tensor] = {}
     rolling_shifted_map: dict[int, dict[float, torch.Tensor]] = {0: {}, 1: {}, 2: {}}
+
+    iso_shifted_map: dict[float, torch.Tensor] = {}
+    cha_shifted_map: dict[float, torch.Tensor] = {}
+    chb_shifted_map: dict[float, torch.Tensor] = {}
+    v2full_shifted_map: dict[float, torch.Tensor] = {}
+    exp2_deb_shifted_map: dict[float, torch.Tensor] = {}
 
     test_word_mask = (events["split"] == "test") & (events["type"] == "Word")
     for shift_sec in args.shifts:
@@ -1113,105 +1524,168 @@ def main(argv: Sequence[str] | None = None) -> dict:
             timeline_bounds,
             s_val,
             window_start_offset=args.window_offset,
-            window_duration=args.window_duration,
+            window_duration=slice_duration,
         )
         shifted_events.loc[test_word_mask, "start"] = shifted_starts
         shifted_events.loc[test_word_mask, "stop"] = (
             shifted_starts + shifted_events.loc[test_word_mask, "duration"].to_numpy()
         )
-        shifted_bundle, _ = slice_split_word_bundle(
+        shifted_raw_bundle, _ = slice_split_word_bundle(
             shifted_events,
             extractors,
             "test",
             word_to_idx,
             window_offset=args.window_offset,
-            window_duration=args.window_duration,
+            window_duration=slice_duration,
             batch_size=args.batch_size,
             workers=args.workers,
             timing_stats=timing_stats,
-            reference_bundle=test_bundle,
+            reference_bundle=test_raw_bundle,
         )
-        s1_shift, _ = predict_word_context_model(
-            word_only_model, shifted_bundle, args.batch_size, run_device
-        )
-        _, joint_shift = predict_word_context_model(
-            full_joint_model, shifted_bundle, args.batch_size, run_device
-        )
-        s1_shifted_map[s_val] = s1_shift
-        joint_shifted_map[s_val] = joint_shift
 
-        with torch.no_grad():
-            frozen_full_shifted_map[s_val] = (
-                frozen_full_model.forward_context_from_embeddings(
-                    s1_shift.to(run_device), test_bundle.sentence_uids
-                ).cpu()
+        if run_exp1:
+            shifted_exp1 = _crop_bundle_frames(shifted_raw_bundle, fixed_frames)
+            s1_shift, _ = predict_word_context_model(
+                word_only_model, shifted_exp1, args.batch_size, run_device
             )
-            r_views = frozen_rolling_model.forward_rolling_from_embeddings(
-                s1_shift.to(run_device),
-                test_bundle.sentence_uids,
-                horizons=(0, 1, 2),
-                history_radius=2,
+            _, joint_shift = predict_word_context_model(
+                full_joint_model, shifted_exp1, args.batch_size, run_device
             )
-            for r in (0, 1, 2):
-                rolling_shifted_map[r][s_val] = r_views[r].cpu()
+            s1_shifted_map[s_val] = s1_shift
+            joint_shifted_map[s_val] = joint_shift
 
-    # Apply LOO-CMS (eta = args.cms_eta)
-    s1_cms_clean, s1_cms_shifted = apply_leave_one_out_cms(
-        test_s1_clean, s1_shifted_map, eta=args.cms_eta
-    )
-    joint_cms_clean, joint_cms_shifted = apply_leave_one_out_cms(
-        test_joint_clean, joint_shifted_map, eta=args.cms_eta
-    )
-    ff_cms_clean, ff_cms_shifted = apply_leave_one_out_cms(
-        test_frozen_full_clean, frozen_full_shifted_map, eta=args.cms_eta
-    )
-    rolling_cms: dict[int, tuple[torch.Tensor, dict[float, torch.Tensor]]] = {}
-    for r in (0, 1, 2):
-        rolling_cms[r] = apply_leave_one_out_cms(
-            rolling_clean_cpu[r], rolling_shifted_map[r], eta=args.cms_eta
-        )
+            with torch.no_grad():
+                frozen_full_shifted_map[s_val] = (
+                    frozen_full_model.forward_context_from_embeddings(
+                        s1_shift.to(run_device), test_exp1.sentence_uids
+                    ).cpu()
+                )
+                r_views = frozen_rolling_model.forward_rolling_from_embeddings(
+                    s1_shift.to(run_device),
+                    test_exp1.sentence_uids,
+                    horizons=(0, 1, 2),
+                    history_radius=2,
+                )
+                for r in (0, 1, 2):
+                    rolling_shifted_map[r][s_val] = r_views[r].cpu()
+
+        if run_exp2:
+            iso_shift, _ = predict_space_chunked_model(
+                exp2_iso_model, shifted_raw_bundle, args.batch_size, run_device
+            )
+            _, cha_shift = predict_space_chunked_model(
+                exp2_cha_model, shifted_raw_bundle, args.batch_size, run_device
+            )
+            _, chb_shift = predict_space_chunked_model(
+                exp2_chb_model, shifted_raw_bundle, args.batch_size, run_device
+            )
+            _, v2full_shift = predict_space_chunked_model(
+                exp2_full_model, shifted_raw_bundle, args.batch_size, run_device
+            )
+            iso_shifted_map[s_val] = iso_shift
+            cha_shifted_map[s_val] = cha_shift
+            chb_shifted_map[s_val] = chb_shift
+            v2full_shifted_map[s_val] = v2full_shift
+            with torch.no_grad():
+                exp2_deb_shifted_map[s_val] = (
+                    exp2_debiased_model.forward_aligner_from_embeddings(
+                        iso_shift.to(run_device), test_raw_bundle.sentence_uids
+                    ).cpu()
+                )
 
     def _eval_pair(c_pred: torch.Tensor, s_map: dict[float, torch.Tensor]) -> dict:
         return summarize_clean_vs_shifted(
             c_pred,
             s_map,
-            test_bundle.word_indices,
-            test_bundle.is_function_word,
+            test_raw_bundle.word_indices,
+            test_raw_bundle.is_function_word,
             embedding_bank,
             vocab_banks["vocab50_indices"],
             vocab_banks["full_vocab_indices"],
         )
 
-    model_summaries = {
-        "0. Timing-Only (Δτ_i, No Neural)": _eval_pair(
+    model_summaries: dict[str, dict] = {
+        "Exp1-0. Timing-Only (Δτ_i, No Neural)": _eval_pair(
             timing_test_preds, timing_shifted_preds
-        ),
-        "1. Word-Only (Stage 1 CNN)": _eval_pair(test_s1_clean, s1_shifted_map),
-        f"1b. Word-Only (+ LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
-            s1_cms_clean, s1_cms_shifted
-        ),
-        "2. Full-Context (Joint, Unfrozen CNN)": _eval_pair(
-            test_joint_clean, joint_shifted_map
-        ),
-        f"2b. Full-Context (Joint + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
-            joint_cms_clean, joint_cms_shifted
-        ),
-        "3. Full-Context (+ Freeze CNN)": _eval_pair(
-            test_frozen_full_clean, frozen_full_shifted_map
-        ),
-        f"3b. Full-Context (+ Freeze CNN + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
-            ff_cms_clean, ff_cms_shifted
-        ),
-        f"4a. Rolling-K0 (Causal + Freeze CNN + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
-            rolling_cms[0][0], rolling_cms[0][1]
-        ),
-        f"4b. Rolling-K1 (Lookahead-1 + Freeze CNN + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
-            rolling_cms[1][0], rolling_cms[1][1]
-        ),
-        f"4c. Rolling-K2 (Lookahead-2 + Freeze CNN + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
-            rolling_cms[2][0], rolling_cms[2][1]
-        ),
+        )
     }
+
+    if run_exp1:
+        s1_cms_clean, s1_cms_shifted = apply_leave_one_out_cms(
+            test_s1_clean, s1_shifted_map, eta=args.cms_eta
+        )
+        joint_cms_clean, joint_cms_shifted = apply_leave_one_out_cms(
+            test_joint_clean, joint_shifted_map, eta=args.cms_eta
+        )
+        ff_cms_clean, ff_cms_shifted = apply_leave_one_out_cms(
+            test_frozen_full_clean, frozen_full_shifted_map, eta=args.cms_eta
+        )
+        rolling_cms: dict[int, tuple[torch.Tensor, dict[float, torch.Tensor]]] = {}
+        for r in (0, 1, 2):
+            rolling_cms[r] = apply_leave_one_out_cms(
+                rolling_clean_cpu[r], rolling_shifted_map[r], eta=args.cms_eta
+            )
+        model_summaries.update(
+            {
+                f"Exp1-1. Word-Only (Fixed T={args.window_duration:.1f}s, Stage 1 CNN)": _eval_pair(
+                    test_s1_clean, s1_shifted_map
+                ),
+                f"Exp1-1b. Word-Only (+ LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
+                    s1_cms_clean, s1_cms_shifted
+                ),
+                f"Exp1-2. Full-Context (Fixed T={args.window_duration:.1f}s, Joint Unfrozen CNN)": _eval_pair(
+                    test_joint_clean, joint_shifted_map
+                ),
+                f"Exp1-2b. Full-Context (Joint + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
+                    joint_cms_clean, joint_cms_shifted
+                ),
+                f"Exp1-3. Full-Context (+ Freeze CNN, Fixed T={args.window_duration:.1f}s)": _eval_pair(
+                    test_frozen_full_clean, frozen_full_shifted_map
+                ),
+                f"Exp1-3b. Full-Context (+ Freeze CNN + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
+                    ff_cms_clean, ff_cms_shifted
+                ),
+                f"Exp1-4a. Rolling-K0 (Causal + Freeze CNN + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
+                    rolling_cms[0][0], rolling_cms[0][1]
+                ),
+                f"Exp1-4b. Rolling-K1 (Lookahead-1 + Freeze CNN + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
+                    rolling_cms[1][0], rolling_cms[1][1]
+                ),
+                f"Exp1-4c. Rolling-K2 (Lookahead-2 + Freeze CNN + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
+                    rolling_cms[2][0], rolling_cms[2][1]
+                ),
+            }
+        )
+
+    if run_exp2:
+        v2full_cms_clean, v2full_cms_shifted = apply_leave_one_out_cms(
+            test_v2full_clean, v2full_shifted_map, eta=args.cms_eta
+        )
+        exp2_deb_cms_clean, exp2_deb_cms_shifted = apply_leave_one_out_cms(
+            test_exp2_debiased_clean, exp2_deb_shifted_map, eta=args.cms_eta
+        )
+        model_summaries.update(
+            {
+                "Exp2-1. Space-Chunked Isolated ([τ_i, τ_{i+1}] Mean-Pool Only)": _eval_pair(
+                    test_iso_clean, iso_shifted_map
+                ),
+                "Exp2-2. Space-Chunked Channel-A (Length-Aware Frame-Count Pool + Aligner)": _eval_pair(
+                    test_cha_clean, cha_shifted_map
+                ),
+                "Exp2-3. Space-Chunked Channel-B (v2 Continuous Conv+Conformer + Mean-Pool)": _eval_pair(
+                    test_chb_clean, chb_shifted_map
+                ),
+                "Exp2-4. Space-Chunked v2-Full (Channel A + B Joint)": _eval_pair(
+                    test_v2full_clean, v2full_shifted_map
+                ),
+                f"Exp2-4b. Space-Chunked v2-Full (+ LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
+                    v2full_cms_clean, v2full_cms_shifted
+                ),
+                f"Exp2-5. Space-Chunked Debiased (Freeze Isolated + Aligner + LOO-CMS η={args.cms_eta:.2f})": _eval_pair(
+                    exp2_deb_cms_clean, exp2_deb_cms_shifted
+                ),
+            }
+        )
 
     md_report, summary_df = format_markdown_report(
         args.modality,
@@ -1227,6 +1701,7 @@ def main(argv: Sequence[str] | None = None) -> dict:
         "modality": args.modality,
         "participants": participants,
         "subjects": subjects,
+        "experiments": list(args.experiments),
         "window_offset_seconds": float(args.window_offset),
         "window_duration_seconds": float(args.window_duration),
         "shifts_seconds": [float(s) for s in args.shifts],
@@ -1235,9 +1710,9 @@ def main(argv: Sequence[str] | None = None) -> dict:
         "seed": int(args.seed),
         "elapsed_seconds": round(time.monotonic() - started, 2),
         "splits": {
-            "train_words": len(train_bundle.words),
-            "val_words": len(val_bundle.words),
-            "test_words": len(test_bundle.words),
+            "train_words": len(train_raw_bundle.words),
+            "val_words": len(val_raw_bundle.words),
+            "test_words": len(test_raw_bundle.words),
             "vocab50_words": vocab_banks["vocab50_words"],
             "full_vocab_size": len(vocab_banks["full_vocab_indices"]),
         },

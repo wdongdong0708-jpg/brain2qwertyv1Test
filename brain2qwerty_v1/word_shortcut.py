@@ -722,3 +722,309 @@ class WordContextModel(nn.Module):
     ) -> torch.Tensor:
         word_emb = self.encode_words(neuro, subject_id, channel_positions)
         return self.forward_context_from_embeddings(word_emb, sentence_uids)
+
+
+class _ContinuousConvBlock(nn.Module):
+    """Dilated + depthwise temporal conv block matching Brain2Qwerty v2 ConvConformer."""
+
+    def __init__(self, dim: int, kernel_size: int = 7, dilation: int = 1):
+        super().__init__()
+        pad = (kernel_size - 1) * dilation // 2
+        self.conv = nn.Sequential(
+            nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=pad, dilation=dilation),
+            nn.GELU(),
+            nn.GroupNorm(num_groups=min(8, dim), num_channels=dim),
+            nn.Conv1d(
+                dim,
+                dim,
+                kernel_size=15,
+                padding=7,
+                groups=dim,
+            ),
+            nn.GELU(),
+            nn.Conv1d(dim, dim, kernel_size=1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + 0.2 * self.conv(x)
+
+
+class SpaceChunkedV2Model(nn.Module):
+    """Brain2Qwerty v2 Space-Chunked ([tau_i, tau_{i+1}]) model for Experiment 2.
+
+    Separates and tests the two duration-shortcut channels in space-delimited chunking:
+    - Channel A (`length_aware_pool=True`): variable frame count L_i = round(delta_tau_i * fs)
+      between two spaces directly exposes word duration / character count to the pooler/aligner.
+    - Channel B (`continuous_encoder=True`): continuous sentence-level wide-receptive-field
+      convolution + frame-level Conformer/Transformer mixes boundary timing across [tau_i, tau_{i+1}]
+      before space-boundary slicing, even when intra-word pooling is a strict mean (`mean(dim=0)`).
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        n_subjects: int = 20,
+        hidden_dim: int = 256,
+        embedding_dim: int = 1024,
+        *,
+        continuous_encoder: bool = True,
+        length_aware_pool: bool = True,
+        use_aligner: bool = True,
+        aligner_depth: int = 3,
+        aligner_heads: int = 4,
+        frequency: float = 50.0,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.hidden_dim = int(hidden_dim)
+        self.embedding_dim = int(embedding_dim)
+        self.continuous_encoder = bool(continuous_encoder)
+        self.length_aware_pool = bool(length_aware_pool)
+        self.use_aligner = bool(use_aligner)
+        self.frequency = float(frequency)
+
+        self.subject_emb = nn.Embedding(max(int(n_subjects) + 4, 8), hidden_dim)
+        self.spatial_proj = nn.Sequential(
+            nn.Conv1d(in_channels, hidden_dim, kernel_size=1),
+            nn.GELU(),
+            nn.GroupNorm(num_groups=min(8, hidden_dim), num_channels=hidden_dim),
+        )
+
+        if self.continuous_encoder:
+            # Channel B: wide-receptive-field dilated conv + frame-level self-attention
+            # operating across the continuous sentence BEFORE slicing at [tau_i, tau_{i+1}]
+            self.conv_blocks = nn.ModuleList(
+                [
+                    _ContinuousConvBlock(hidden_dim, kernel_size=7, dilation=1),
+                    _ContinuousConvBlock(hidden_dim, kernel_size=7, dilation=2),
+                    _ContinuousConvBlock(hidden_dim, kernel_size=7, dilation=4),
+                ]
+            )
+            frame_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=aligner_heads,
+                dim_feedforward=hidden_dim * 2,
+                dropout=0.1,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.frame_transformer = nn.TransformerEncoder(
+                frame_layer, num_layers=2, enable_nested_tensor=False
+            )
+            self.frame_pos_emb = nn.Parameter(
+                torch.randn(1, 2048, hidden_dim) * 0.02
+            )
+        else:
+            # Isolated per-chunk frame encoder: zero cross-boundary receptive field
+            self.isolated_conv = nn.Sequential(
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1),
+                nn.GELU(),
+                nn.GroupNorm(num_groups=min(8, hidden_dim), num_channels=hidden_dim),
+                nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1),
+            )
+            self.conv_blocks = None
+            self.frame_transformer = None
+            self.frame_pos_emb = None
+
+        # Intra-word frame MLP matching brain2qwerty_v2.ctc_segmenter._IntraWordMLPPooler
+        self.intra_word_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        if self.length_aware_pool:
+            # Channel A: pooler retains variable frame count L_i between spaces
+            self.len_proj = nn.Sequential(
+                nn.Linear(3, hidden_dim),
+                nn.GELU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.sum_scale = nn.Parameter(torch.tensor(0.5))
+        else:
+            self.len_proj = None
+            self.sum_scale = None
+
+        self.word_proj = nn.Linear(hidden_dim, embedding_dim)
+
+        if self.use_aligner:
+            self.aligner_in = nn.Sequential(
+                nn.LayerNorm(embedding_dim),
+                nn.Linear(embedding_dim, hidden_dim),
+            )
+            aligner_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim,
+                nhead=aligner_heads,
+                dim_feedforward=hidden_dim * 4,
+                dropout=0.1,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.aligner = nn.TransformerEncoder(
+                aligner_layer, num_layers=aligner_depth, enable_nested_tensor=False
+            )
+            self.aligner_out = nn.Linear(hidden_dim, embedding_dim)
+        else:
+            self.aligner_in = None
+            self.aligner = None
+            self.aligner_out = None
+
+    def _compute_chunk_frame_lengths(
+        self, delta_taus: torch.Tensor, max_frames: int
+    ) -> torch.Tensor:
+        frames = torch.round(delta_taus.float() * self.frequency).long()
+        return torch.clamp(frames, min=2, max=max(int(max_frames), 2))
+
+    def _pool_chunk(
+        self,
+        frames_hd: torch.Tensor,
+        chunk_len: int,
+        rel_pos: float,
+    ) -> torch.Tensor:
+        """Pool variable-length space-delimited word chunk (L_i, D) -> (D,)."""
+        h = self.intra_word_mlp(frames_hd[:chunk_len])
+        mean_vec = h.mean(dim=0)
+        if not self.length_aware_pool or self.len_proj is None:
+            return mean_vec
+        l_f = float(chunk_len)
+        len_feat = frames_hd.new_tensor(
+            [l_f / 20.0, float(np.log1p(l_f)), float(rel_pos)]
+        )
+        sum_vec = mean_vec * (l_f / 20.0)
+        return mean_vec + self.sum_scale * sum_vec + self.len_proj(len_feat)
+
+    def encode_space_chunks(
+        self,
+        neuro: torch.Tensor,
+        subject_id: torch.Tensor,
+        delta_taus: torch.Tensor,
+        sentence_uids: Sequence[str],
+    ) -> torch.Tensor:
+        """Encode variable-length space-delimited chunks [tau_i, tau_{i+1}] per word."""
+        device = neuro.device
+        n_words, _, max_frames = neuro.shape
+        subj_idx = subject_id.view(-1).long().clamp(
+            min=0, max=self.subject_emb.num_embeddings - 1
+        )
+        subj_vec = self.subject_emb(subj_idx).unsqueeze(-1)
+        chunk_lens = self._compute_chunk_frame_lengths(delta_taus.to(device), max_frames)
+
+        groups: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(sentence_uids):
+            groups[str(uid)].append(idx)
+        group_list = list(groups.values())
+
+        word_vecs = neuro.new_zeros((n_words, self.hidden_dim))
+
+        if not self.continuous_encoder:
+            # Isolated per-chunk path (Channel B = OFF): mask frames strictly to [0, L_i)
+            t_grid = torch.arange(max_frames, device=device).unsqueeze(0)
+            valid_mask = (t_grid < chunk_lens.unsqueeze(1)).unsqueeze(1).float()
+            x_masked = neuro.float() * valid_mask
+            h = (self.spatial_proj(x_masked) + subj_vec) * valid_mask
+            h = (h + 0.2 * self.isolated_conv(h)) * valid_mask
+            h_td = h.transpose(1, 2)  # (N, T, D)
+            for rows in group_list:
+                seq_len = max(len(rows), 1)
+                for pos, r_idx in enumerate(rows):
+                    l_i = int(chunk_lens[r_idx].item())
+                    word_vecs[r_idx] = self._pool_chunk(
+                        h_td[r_idx], l_i, rel_pos=pos / seq_len
+                    )
+        else:
+            # Continuous sentence path (Channel B = ON): stitch continuous sentence
+            # waveform from contiguous [tau_i, tau_{i+1}] chunks, run wide Conv + Conformer,
+            # then slice at exact space boundaries [s_i, e_i].
+            sent_tensors: list[torch.Tensor] = []
+            sent_subjs: list[torch.Tensor] = []
+            sent_spans: list[list[tuple[int, int, int, float]]] = []
+            max_sent_len = 0
+            for rows in group_list:
+                pieces: list[torch.Tensor] = []
+                spans: list[tuple[int, int, int, float]] = []
+                cursor = 0
+                seq_len = max(len(rows), 1)
+                for pos, r_idx in enumerate(rows):
+                    l_i = int(chunk_lens[r_idx].item())
+                    pieces.append(neuro[r_idx, :, :l_i].float())
+                    spans.append((r_idx, cursor, cursor + l_i, pos / seq_len))
+                    cursor += l_i
+                sent_cat = torch.cat(pieces, dim=-1)
+                sent_tensors.append(sent_cat)
+                sent_subjs.append(subj_vec[rows[0]])
+                sent_spans.append(spans)
+                max_sent_len = max(max_sent_len, cursor)
+
+            g_count = len(group_list)
+            padded_sent = neuro.new_zeros((g_count, self.in_channels, max_sent_len))
+            sent_pad_mask = torch.ones(
+                (g_count, max_sent_len), dtype=torch.bool, device=device
+            )
+            subj_sent = torch.stack(sent_subjs, dim=0)
+            for g_idx, s_t in enumerate(sent_tensors):
+                t_len = s_t.shape[-1]
+                padded_sent[g_idx, :, :t_len] = s_t
+                sent_pad_mask[g_idx, :t_len] = False
+
+            h_sent = self.spatial_proj(padded_sent) + subj_sent
+            for block in self.conv_blocks:
+                h_sent = block(h_sent)
+            h_frames = h_sent.transpose(1, 2)  # (G, T_sent, D)
+            pos_len = min(max_sent_len, self.frame_pos_emb.shape[1])
+            h_frames[:, :pos_len] = h_frames[:, :pos_len] + self.frame_pos_emb[:, :pos_len]
+            z_final = self.frame_transformer(
+                h_frames, src_key_padding_mask=sent_pad_mask
+            )
+
+            # CTCSpaceSegmenter-style slicing by space boundaries [s_i, e_i]
+            for g_idx, spans in enumerate(sent_spans):
+                for r_idx, s_i, e_i, rel_pos in spans:
+                    chunk_frames = z_final[g_idx, s_i:e_i]
+                    word_vecs[r_idx] = self._pool_chunk(
+                        chunk_frames, e_i - s_i, rel_pos=rel_pos
+                    )
+
+        return F.normalize(self.word_proj(word_vecs), dim=-1, eps=1e-12)
+
+    def forward_aligner_from_embeddings(
+        self,
+        word_embeddings: torch.Tensor,
+        sentence_uids: Sequence[str],
+    ) -> torch.Tensor:
+        if not self.use_aligner or self.aligner is None:
+            return F.normalize(word_embeddings.float(), dim=-1, eps=1e-12)
+        h = self.aligner_in(word_embeddings.float())
+        groups: dict[str, list[int]] = defaultdict(list)
+        for idx, uid in enumerate(sentence_uids):
+            groups[str(uid)].append(idx)
+        group_list = list(groups.values())
+        max_len = max(len(g) for g in group_list)
+        batch_h = h.new_zeros((len(group_list), max_len, h.shape[-1]))
+        pad_mask = torch.ones(
+            (len(group_list), max_len), dtype=torch.bool, device=h.device
+        )
+        for g_idx, rows in enumerate(group_list):
+            batch_h[g_idx, : len(rows)] = h[rows]
+            pad_mask[g_idx, : len(rows)] = False
+        ctx = self.aligner(batch_h, src_key_padding_mask=pad_mask)
+        out = word_embeddings.new_zeros((len(word_embeddings), self.embedding_dim))
+        for g_idx, rows in enumerate(group_list):
+            out[rows] = self.aligner_out(ctx[g_idx, : len(rows)])
+        return F.normalize(out + word_embeddings.float(), dim=-1, eps=1e-12)
+
+    def forward(
+        self,
+        neuro: torch.Tensor,
+        subject_id: torch.Tensor,
+        delta_taus: torch.Tensor,
+        sentence_uids: Sequence[str],
+    ) -> torch.Tensor:
+        chunk_embs = self.encode_space_chunks(
+            neuro, subject_id, delta_taus, sentence_uids
+        )
+        return self.forward_aligner_from_embeddings(chunk_embs, sentence_uids)
+
