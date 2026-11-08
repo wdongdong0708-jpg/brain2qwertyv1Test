@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 from collections import Counter, defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
@@ -284,6 +285,11 @@ def load_or_compute_bge_m3_embeddings(
                 cls_vecs = F.normalize(outputs.last_hidden_state[:, 0].float(), dim=-1)
                 for w, vec in zip(batch_words, cls_vecs.cpu().numpy()):
                     cached_map[w] = vec.astype(np.float32)
+
+        del model, tokenizer
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         all_words = sorted(cached_map.keys())
         all_vecs = np.stack([cached_map[w] for w in all_words]).astype(np.float32)
@@ -975,7 +981,9 @@ class SpaceChunkedV2Model(nn.Module):
                 h_sent = block(h_sent)
             h_frames = h_sent.transpose(1, 2)  # (G, T_sent, D)
             pos_len = min(max_sent_len, self.frame_pos_emb.shape[1])
-            h_frames[:, :pos_len] = h_frames[:, :pos_len] + self.frame_pos_emb[:, :pos_len]
+            pos_pad = torch.zeros_like(h_frames)
+            pos_pad[:, :pos_len] = self.frame_pos_emb[:, :pos_len]
+            h_frames = h_frames + pos_pad
             z_final = self.frame_transformer(
                 h_frames, src_key_padding_mask=sent_pad_mask
             )

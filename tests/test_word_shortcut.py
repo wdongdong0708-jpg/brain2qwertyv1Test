@@ -417,4 +417,40 @@ def test_verify_word_shortcut_training_pipeline_end_to_end():
         deb_preds = exp2_deb.forward_aligner_from_embeddings(iso_embs, bundle.sentence_uids)
     assert deb_preds.shape == (len(words), 32)
 
+    # Verify real SimpleConvTimeAgg (ENCODER) lazy parameter cleanup in train_neural_word_model
+    import copy
+
+    import pydantic
+    from neuraltrain.models import BaseModelConfig as ModelConfig
+
+    from brain2qwerty_v1.config.model_config import ENCODER
+
+    raw_cfg = copy.deepcopy(ENCODER)
+    raw_cfg["hidden"] = 16
+    raw_cfg["subject_layers_config"]["n_subjects"] = 2
+    raw_cfg["merger_config"]["n_subjects"] = 2
+    enc_cfg = pydantic.TypeAdapter(ModelConfig).validate_python(raw_cfg)
+    real_enc = enc_cfg.build(n_in_channels=8, n_outputs=16)
+    pos_bundle = SplitWordBundle(
+        **{
+            **bundle.__dict__,
+            "channel_positions": torch.randn(len(words), 8, 2),
+        }
+    )
+    real_s1 = WordContextModel(
+        brain_encoder=real_enc,
+        encoder_out_dim=16,
+        embedding_dim=32,
+        use_transformer=False,
+    )
+    real_s1 = train_neural_word_model(
+        "Real-Stage1", real_s1, pos_bundle, pos_bundle, bank, vb,
+        epochs=1, batch_size=32, lr=1e-3, seed=33, device=device,
+    )
+    assert not any(
+        isinstance(p, torch.nn.parameter.UninitializedParameter)
+        for p in real_s1.parameters()
+    )
+
+
 

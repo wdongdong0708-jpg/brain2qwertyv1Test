@@ -170,13 +170,16 @@ run_live([PYTHON, "-c", "import torch, brain2qwerty_v1; print('GPU available:', 
             cell(
                 "code",
                 """
+            subprocess.run(["git", "-C", str(CODE), "pull", "--ff-only"], check=True)
             SHORTCUT_MODALITY = "meg"   # meg (features_meg.tar) / eeg (features.tar)
-            SHORTCUT_SUBJECTS = ["--subject", "all"]
+            SHORTCUT_SUBJECTS = ["--num-subjects", "1"]  # 快速单人验证；3人填 ["3"]，全量填 ["--subject", "all"]
+            SHORTCUT_PROFILE = "small"  # 快速验证用 "small" (~1分钟跑完)；正式全量用 "full"
             EXPERIMENTS = ["exp1", "exp2"]  # ["exp1", "exp2"] 同时跑实验一与实验二，或单独跑 ["exp1"] / ["exp2"]
-            WINDOW_DURATION = 1.0           # 实验一固定词窗时长：1.0 (重叠约 67%) 或 0.5 (重叠约 34%)
-            SHORTCUT_EPOCHS = 20
+            WINDOW_DURATION = 0.5           # 实验一固定词窗时长：0.5 (重叠约 32%) 或 1.0 (重叠约 63%)
+            SHORTCUT_EPOCHS = 15
             run_live([PYTHON, "-u", "-m", "brain2qwerty_v1.scripts.verify_word_shortcut",
                       "--modality", SHORTCUT_MODALITY, *SHORTCUT_SUBJECTS,
+                      "--profile", SHORTCUT_PROFILE,
                       "--experiments", *EXPERIMENTS,
                       "--window-duration", str(WINDOW_DURATION),
                       "--epochs", str(SHORTCUT_EPOCHS),

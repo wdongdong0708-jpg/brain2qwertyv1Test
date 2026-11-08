@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
+import sys
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -165,8 +168,9 @@ def compute_timeline_bounds(
     if not rec_rows.empty:
         for tl, grp in rec_rows.groupby("timeline"):
             r_min = float(grp["start"].min())
-            r_max = float((grp["start"] + grp["duration"]).max())
-            bounds[str(tl)] = (r_min, r_max)
+            r_max = float((grp["start"] + grp["duration"].fillna(1.0)).max())
+            if pd.notna(r_min) and pd.notna(r_max) and r_max > r_min:
+                bounds[str(tl)] = (r_min, r_max)
     for tl, grp in events.groupby("timeline"):
         if str(tl) not in bounds:
             r_min = float(grp["start"].min()) - 5.0
@@ -265,9 +269,13 @@ def slice_split_word_bundle(
     reference_bundle: SplitWordBundle | None = None,
 ) -> tuple[SplitWordBundle, dict]:
     """Slice all Word segments for a split into a contiguous in-memory SplitWordBundle."""
-    mask = (events["split"] == split) & (events["type"] == "Word")
+    sub_mask = events["type"].isin(["Meg", "Eeg"]) | (
+        (events["type"] == "Word") & (events["split"] == split)
+    )
+    sub_events = events.loc[sub_mask].reset_index(drop=True)
+    mask = sub_events["type"] == "Word"
     segments = ns.segments.list_segments(
-        events, mask, start=float(window_offset), duration=float(window_duration)
+        sub_events, mask, start=float(window_offset), duration=float(window_duration)
     )
     if not segments:
         raise RuntimeError(f"No Word segments found for split={split!r}")
@@ -515,6 +523,21 @@ def _materialize_word_context_model(
         )
         suids = bundle.sentence_uids[:n]
         model(neuro, subj, suids, pos)
+        for name, param in list(model.named_parameters()):
+            if isinstance(param, torch.nn.parameter.UninitializedParameter):
+                parent = (
+                    model.get_submodule(name.rsplit(".", 1)[0])
+                    if "." in name
+                    else model
+                )
+                attr = name.rsplit(".", 1)[-1]
+                setattr(
+                    parent,
+                    attr,
+                    torch.nn.Parameter(
+                        torch.empty(1, device=device), requires_grad=False
+                    ),
+                )
     model.train()
 
 
@@ -1036,7 +1059,8 @@ def main(argv: Sequence[str] | None = None) -> dict:
     xp = WorkflowExperiment(**cfg)
     summary = xp.data.study.study_summary(apply_query=False)
     subjects = select_subjects(summary, requested, args.num_subjects)
-    cfg = make_config(wf_args, selected_subjects=subjects)
+    if args.num_subjects is not None:
+        cfg = make_config(wf_args, selected_subjects=subjects)
     cfg["data"]["transforms"] = [
         {"name": "SpanishBCBLWordPreprocessing"},
         {"name": "Brain2QwertyV1Splitter", "seed": 1},
@@ -1084,6 +1108,10 @@ def main(argv: Sequence[str] | None = None) -> dict:
 
     started = time.monotonic()
     raw_events = xp.data.build_events()
+    raw_events = raw_events[
+        raw_events["type"].isin(["Meg", "Eeg", "Word"])
+    ].reset_index(drop=True)
+    gc.collect()
     timeline_bounds = compute_timeline_bounds(raw_events, args.modality)
     events = filter_sentences_within_bounds(
         raw_events,
@@ -1128,7 +1156,20 @@ def main(argv: Sequence[str] | None = None) -> dict:
     vocab_banks = build_vocabulary_banks(word_events, vocab_words, top_k_50=50)
     word_to_idx = vocab_banks["word_to_idx"]
 
-    xp.data.neuro.prepare(events)
+    try:
+        xp.data.neuro.prepare(events)
+    except Exception as exc:
+        if args.require_cache:
+            archive_hint = (
+                "features_meg.tar" if args.modality == "meg" else "features.tar"
+            )
+            raise RuntimeError(
+                f"Cache miss under {xp.data.neuro.infra.folder} with --require-cache. "
+                f"Ensure {archive_hint} is unpacked into {xp.data.neuro.infra.folder}, "
+                f"or omit --require-cache to allow on-the-fly feature extraction. "
+                f"Original error: {exc}"
+            ) from exc
+        raise
     subject_id_extractor = ns.extractors.LabelEncoder(
         event_types=xp.data.neuro.event_types, event_field="subject"
     )
@@ -1729,4 +1770,9 @@ def main(argv: Sequence[str] | None = None) -> dict:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
+        raise

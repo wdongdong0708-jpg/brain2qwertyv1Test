@@ -263,6 +263,9 @@ class SpanishBCBLWordPreprocessing(EventsTransform):
         events["type"] = events["type"].replace(
             {"Button": "Keystroke", "DetectedButton": "Keystroke"}
         )
+        events = events[
+            events["type"].isin(["Meg", "Eeg", "Keystroke", "Word"])
+        ].copy()
 
         # drop the two practice trials of each block (NaN trial_id on Meg/Eeg rows is kept)
         events = events[~events["trial_id"].isin([0.0, 1.0])]
