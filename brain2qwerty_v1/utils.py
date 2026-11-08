@@ -223,6 +223,21 @@ def select_participants(events):
     return events
 
 
+def subject_labels(modality: str, subject: str) -> list[str]:
+    number = int(subject.rsplit("/", 1)[-1].lstrip("Ss"))
+    if number < 1:
+        raise ValueError("Subject number must be positive")
+    if modality == "eeg":
+        return [f"Pinet2024Eeg/{number:03d}"]
+    label = f"Pinet2024Meg/S{number}"
+    label = SUBJECT_MERGE.get(label, label)
+    if label.endswith("/S23"):
+        raise ValueError("MEG S23 is excluded by the official preprocessing")
+    return [label] + [
+        alias for alias, canonical in SUBJECT_MERGE.items() if canonical == label
+    ]
+
+
 # --- Training helpers ------------------------------------------------------
 def materialize_lazy_params(module: torch.nn.Module, loader) -> None:
     """Initialise lazy params (e.g. the channel merger's ``LazyLinear``) with a

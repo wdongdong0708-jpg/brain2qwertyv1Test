@@ -421,9 +421,9 @@ def test_verify_word_shortcut_training_pipeline_end_to_end():
     import copy
 
     import pydantic
-    from neuraltrain.models import BaseModelConfig as ModelConfig
 
     from brain2qwerty_v1.config.model_config import ENCODER
+    from neuraltrain.models import BaseModelConfig as ModelConfig
 
     raw_cfg = copy.deepcopy(ENCODER)
     raw_cfg["hidden"] = 16

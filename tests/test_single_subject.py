@@ -2,10 +2,10 @@ from types import SimpleNamespace
 
 import torch
 
+from brain2qwerty_v1.cache import timeline_cache_key
 from brain2qwerty_v1.callbacks import LogSentencePredictions
 from brain2qwerty_v1.scripts.extract_predictions import extract_subject
-from brain2qwerty_v1.scripts.single_subject import subject_labels, timeline_cache_key
-from brain2qwerty_v1.utils import SentenceBatchSampler
+from brain2qwerty_v1.utils import SentenceBatchSampler, subject_labels
 
 
 def test_batches_preserve_sentences_and_all_keystrokes():

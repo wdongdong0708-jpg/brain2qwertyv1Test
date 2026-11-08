@@ -22,8 +22,12 @@ from .config.model_config import EEG_ENCODER, ENCODER
 from .config.xp_config import experiment_config
 from .context import LOCAL_CONTEXT
 from .main import Experiment
-from .scripts.single_subject import subject_labels
-from .utils import CONTROL_SUBJECTS, EXCLUDED_SUBJECTS, select_participants
+from .utils import (
+    CONTROL_SUBJECTS,
+    EXCLUDED_SUBJECTS,
+    select_participants,
+    subject_labels,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 

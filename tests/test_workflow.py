@@ -3,21 +3,43 @@ import io
 import json
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 import studies  # noqa: F401
 from brain2qwerty_v1 import workflow
 from brain2qwerty_v1.cache import cache_signature, configure_cache, neuro_cache_key
 from brain2qwerty_v1.config.model_config import EEG_ENCODER, ENCODER
 from brain2qwerty_v1.config.xp_config import experiment_config
-from brain2qwerty_v1.fast_context import CachedFeatureDataset
 from brain2qwerty_v1.main import Experiment
 from scripts.cache_archive import pack, unpack
+from scripts.prepare_local import check_brainvision_files, safe_path, select_files
 from studies.spanishbcbl import Pinet2024Eeg, Pinet2024Meg
+
+
+class _DummySplitDataset(Dataset):
+    def __init__(self, split: str):
+        self.neuro = torch.ones(2, 3)
+        self.segments = [
+            SimpleNamespace(trigger=SimpleNamespace(extra={"sentence_UID": split}))
+            for _ in range(2)
+        ]
+
+    def __len__(self) -> int:
+        return len(self.segments)
+
+    def __getitem__(self, idx: int) -> int:
+        return idx
+
+    def collate_fn(self, indices):
+        return SimpleNamespace(
+            data={"neuro": self.neuro[indices]},
+            segments=[self.segments[i] for i in indices],
+        )
 
 
 def eeg_files(root, renamed=False):
@@ -165,11 +187,7 @@ def test_cpu_cache_never_calls_cuda_model_build_or_trainer(tmp_path, monkeypatch
     root = eeg_files(tmp_path / "raw")
     loaders = {}
     for split in ("train", "val", "test"):
-        data = CachedFeatureDataset(
-            torch.ones(2, 3),
-            torch.tensor([0, 1]),
-            [{"sentence_UID": split, "onset": float(i), "prompt": "a"} for i in range(2)],
-        )
+        data = _DummySplitDataset(split)
         loaders[split] = DataLoader(data, batch_size=2, collate_fn=data.collate_fn)
     from brain2qwerty_v1.main import Data
 
@@ -238,3 +256,40 @@ def test_colab_notebooks_contain_git_commands_and_no_embedded_source():
         text = (root / "notebooks" / name).read_text(encoding="utf-8")
         assert "git" in text and "clone" in text and "pull" in text
         assert "SOURCE_BASE64" not in text and "b64decode" not in text
+
+
+def test_prepare_local_selects_only_subject_signal_and_matlab_logs():
+    names = [
+        "EEG/EEG/002_DECOMEG_S1_1_task1.vhdr",
+        "EEG/EEG/002_DECOMEG_S1_1_task1.eeg",
+        "EEG/EEG/002_DECOMEG_S1_1_task1.vmrk",
+        "EEG/logs/nested/S2_session1_block1_list1.mat",
+        "EEG/EEG/002_DECOMEG_S1_1_tapping.eeg",
+        "EEG/logs/S20_session1_block1.mat",
+        "EEG/EEG/003_DECOMEG_S1_1_task1.vhdr",
+        "MEG/logs/S2_session1_block1.mat",
+        "MEG/all_events.tsv",
+    ]
+    selected = select_files(
+        [SimpleNamespace(path=name, size=10) for name in names], "002"
+    )
+    assert {row["path"] for row in selected} == set(names[:4])
+    with pytest.raises(ValueError, match="excludes subject 001"):
+        select_files([], "001")
+    with pytest.raises(RuntimeError, match="MATLAB"):
+        select_files([SimpleNamespace(path=names[0], size=10)], "002")
+
+
+def test_brainvision_missing_companion_is_detected_before_training(tmp_path):
+    folder = tmp_path / "EEG/EEG"
+    folder.mkdir(parents=True)
+    (folder / "002_x_task1.vhdr").write_text(
+        "DataFile=data.eeg\nMarkerFile=data.vmrk\n"
+    )
+    (folder / "data.eeg").write_bytes(b"data")
+    with pytest.raises(RuntimeError, match="data.vmrk"):
+        check_brainvision_files(tmp_path, "002")
+    (folder / "data.vmrk").write_text("marker")
+    assert check_brainvision_files(tmp_path, "002") == 1
+    with pytest.raises(ValueError, match="escapes"):
+        safe_path(tmp_path, "../elsewhere")

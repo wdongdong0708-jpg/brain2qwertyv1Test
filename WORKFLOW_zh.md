@@ -1,6 +1,6 @@
 # 本地研发 → GitHub → 云端缓存与训练
 
-统一入口为 `python -m brain2qwerty_v1 {cache,smoke,train,eval}`，原来的 `python -m brain2qwerty_v1.main` 也转到同一入口。默认 EEG、全部有效受试者、单个种子 33、单 GPU、原尺寸模型；单受试者请明确传 `--subject 002`。以前的局部上下文与冻结/联合微调实验脚本仍保留，已有输出没有迁移或删除。
+统一入口为 `python -m brain2qwerty_v1 {cache,smoke,train,eval}`，原来的 `python -m brain2qwerty_v1.main` 也转到同一入口。默认 EEG、全部有效受试者、单个种子 33、单 GPU、原尺寸模型；单受试者请明确传 `--subject 002`。
 
 代码仓库：<https://github.com/wdongdong0708-jpg/brain2qwertyv1Test>。CPU/GPU Notebook 只通过 Git 获取源码。
 

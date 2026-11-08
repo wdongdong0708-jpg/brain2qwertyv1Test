@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import gc
 from collections import Counter, defaultdict
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -696,7 +695,6 @@ class WordContextModel(nn.Module):
 
         results: dict[int, torch.Tensor] = {}
         n_total = len(word_embeddings)
-        width_max = int(history_radius) + max(int(r) for r in horizons) + 1
 
         for r in horizons:
             r_int = int(r)

@@ -2,14 +2,71 @@ import argparse
 import hashlib
 import os
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 
-from brain2qwerty_v1.scripts.colab_data import (
-    check_brainvision_files,
-    safe_path,
-    select_files,
-)
+
+def validate_subject(subject):
+    number = int(subject)
+    if number < 1:
+        raise ValueError("Subject must be positive")
+    if number == 1:
+        raise ValueError("The upstream EEG reader excludes subject 001. Use EEG 002.")
+    return f"{number:03d}"
+
+
+def select_files(entries, subject):
+    subject = validate_subject(subject)
+    selected = []
+    for entry in entries:
+        path = entry.path
+        name = PurePosixPath(path).name
+        signal = (
+            path.startswith(f"EEG/EEG/{subject}_")
+            and "_task" in name
+            and name.endswith((".eeg", ".vhdr", ".vmrk"))
+        )
+        log = (
+            path.startswith("EEG/logs/")
+            and name.startswith(f"S{int(subject)}_session")
+            and "_block" in name
+            and name.endswith(".mat")
+        )
+        if signal or log:
+            selected.append({"path": path, "bytes": int(entry.size)})
+    if not any(row["path"].endswith(".vhdr") for row in selected):
+        raise RuntimeError("No EEG headers match the selected subject")
+    if not any(row["path"].endswith(".mat") for row in selected):
+        raise RuntimeError("No MATLAB keystroke logs match the selected subject")
+    return sorted(selected, key=lambda row: row["path"])
+
+
+def safe_path(root, relative):
+    path = (Path(root) / relative).resolve()
+    if not path.is_relative_to(Path(root).resolve()):
+        raise ValueError("Dataset path escapes the requested directory")
+    return path
+
+
+def check_brainvision_files(root, subject):
+    folder = Path(root) / "EEG/EEG"
+    headers = sorted(folder.glob(f"{subject}_*task*.vhdr"))
+    if not headers:
+        raise RuntimeError("EEG header files are missing")
+    for header in headers:
+        references = {}
+        for line in header.read_text(encoding="utf-8-sig", errors="replace").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                if key.strip().lower() in {"datafile", "markerfile"}:
+                    references[key.strip().lower()] = value.strip()
+        for key in ("datafile", "markerfile"):
+            if key not in references:
+                raise RuntimeError(f"{header.name} has no {key} reference")
+            target = safe_path(header.parent, references[key])
+            if not target.is_file():
+                raise RuntimeError(f"Missing {references[key]} required by {header.name}")
+    return len(headers)
 
 
 def stage_subject(source: Path, destination: Path, subject="002") -> dict:
