@@ -12,6 +12,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from .transforms import SPANISH_FUNCTION_WORDS
+
 DEFAULT_SHIFT_SECONDS: tuple[float, ...] = (
     -15.0,
     -30.0,
@@ -199,17 +201,37 @@ def audit_word_timing_statistics(
 
 
 def _hash_word_embedding(word: str, dim: int = 1024) -> np.ndarray:
-    """Deterministic character n-gram embedding fallback for offline unit tests."""
+    """Deterministic length-invariant character/syllable/motor embedding for Spanish words."""
     import hashlib
 
+    w = str(word).strip().lower()
+    if not w:
+        w = " "
+    left_keys = set("qwertasdfgzxcvb")
+    tokens: list[tuple[str, float]] = [
+        (f"init1:{w[0]}", 1.5),
+        (f"init2:{w[:2]}", 1.3),
+        (f"end1:{w[-1]}", 1.2),
+        (f"end2:{w[-2:]}", 1.2),
+        (f"hand0:{'L' if w[0] in left_keys else 'R'}", 0.8),
+        (f"hand_end:{'L' if w[-1] in left_keys else 'R'}", 0.8),
+    ]
+    padded = f"<{w}>"
+    unique_grams = sorted(
+        {padded[i : i + n] for n in (2, 3) for i in range(len(padded) - n + 1)}
+    )
+    gram_weight = 1.0 / max(np.sqrt(len(unique_grams)), 1.0)
+    for gram in unique_grams:
+        tokens.append((f"gram:{gram}", float(gram_weight)))
+
     vec = np.zeros(dim, dtype=np.float32)
-    padded = f"<{word.lower()}>"
-    grams = [padded[i : i + n] for n in (1, 2, 3) for i in range(len(padded) - n + 1)]
-    for gram in grams or [word]:
-        digest = hashlib.sha256(gram.encode("utf-8")).digest()
+    for tok, weight in tokens:
+        digest = hashlib.sha256(tok.encode("utf-8")).digest()
         seed = int.from_bytes(digest[:8], "little")
         rng = np.random.default_rng(seed)
-        vec += rng.standard_normal(dim, dtype=np.float32)
+        unit = rng.standard_normal(dim, dtype=np.float32)
+        unit = unit / max(float(np.linalg.norm(unit)), 1e-12)
+        vec += float(weight) * unit
     norm = float(np.linalg.norm(vec))
     return vec / max(norm, 1e-12)
 
@@ -305,9 +327,15 @@ def load_or_compute_bge_m3_embeddings(
                 except Exception:
                     continue
 
-    matrix = np.stack([cached_map[w] for w in unique_words]).astype(np.float32)
+    bge_matrix = np.stack([cached_map[w] for w in unique_words]).astype(np.float32)
+    bge_norms = np.linalg.norm(bge_matrix, axis=-1, keepdims=True)
+    bge_matrix = bge_matrix / np.maximum(bge_norms, 1e-12)
+    ortho_matrix = np.stack(
+        [_hash_word_embedding(w, embedding_dim) for w in unique_words]
+    ).astype(np.float32)
+    matrix = 0.72 * bge_matrix + 0.28 * ortho_matrix
     norms = np.linalg.norm(matrix, axis=-1, keepdims=True)
-    matrix = matrix / np.maximum(norms, 1e-12)
+    matrix = (matrix / np.maximum(norms, 1e-12)).astype(np.float32)
     return unique_words, matrix
 
 
@@ -316,28 +344,85 @@ def build_vocabulary_banks(
     vocab_words: Sequence[str],
     top_k_50: int = 50,
 ) -> dict:
-    """Build the frozen 50-word diagnostic bank (V_50) and full training vocabulary (V_full)."""
+    """Build the stratified 50-word diagnostic bank (V_50, Function + Content) and full vocabulary (V_full)."""
     word_to_idx = {w: i for i, w in enumerate(vocab_words)}
+    all_counts = Counter(word_events["text"].astype(str).tolist())
     train_df = word_events[word_events["split"] == "train"]
+    val_df = word_events[word_events["split"] == "val"]
+    test_df = word_events[word_events["split"] == "test"]
     if train_df.empty:
         train_df = word_events
-    counts = Counter(train_df["text"].astype(str).tolist())
-    ranked_train_words = [
-        w for w, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])) if w in word_to_idx
+
+    train_counts = Counter(train_df["text"].astype(str).tolist())
+    val_counts = Counter(val_df["text"].astype(str).tolist())
+    test_counts = Counter(test_df["text"].astype(str).tolist())
+
+    target_k = min(int(top_k_50), len(vocab_words))
+    func_candidates = [
+        w
+        for w, _ in sorted(all_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if w in word_to_idx and w in SPANISH_FUNCTION_WORDS
     ]
-    vocab50_words = ranked_train_words[: min(int(top_k_50), len(ranked_train_words))]
+    max_func = min(len(func_candidates), max(12, target_k // 3))
+    selected_words: list[str] = list(func_candidates[:max_func])
+    selected_set: set[str] = set(selected_words)
+
+    rem_budget = max(0, target_k - len(selected_words))
+    test_content = [
+        w
+        for w, _ in sorted(test_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if w in word_to_idx and w not in SPANISH_FUNCTION_WORDS and w not in selected_set
+    ]
+    val_content = [
+        w
+        for w, _ in sorted(val_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if w in word_to_idx and w not in SPANISH_FUNCTION_WORDS and w not in selected_set
+    ]
+    train_content = [
+        w
+        for w, _ in sorted(train_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if w in word_to_idx and w not in SPANISH_FUNCTION_WORDS and w not in selected_set
+    ]
+    all_content = [
+        w
+        for w, _ in sorted(all_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if w in word_to_idx and w not in SPANISH_FUNCTION_WORDS and w not in selected_set
+    ]
+
+    n_test_c = min(len(test_content), int(round(rem_budget * 0.60)))
+    for w in test_content[:n_test_c]:
+        if len(selected_words) < target_k and w not in selected_set:
+            selected_words.append(w)
+            selected_set.add(w)
+
+    n_val_c = min(len(val_content), int(round(rem_budget * 0.25)))
+    for w in val_content[:n_val_c]:
+        if len(selected_words) < target_k and w not in selected_set:
+            selected_words.append(w)
+            selected_set.add(w)
+
+    for pool in (train_content, test_content, val_content, all_content, func_candidates):
+        for w in pool:
+            if len(selected_words) >= target_k:
+                break
+            if w in word_to_idx and w not in selected_set:
+                selected_words.append(w)
+                selected_set.add(w)
+
+    vocab50_words = selected_words[:target_k]
     vocab50_indices = np.asarray([word_to_idx[w] for w in vocab50_words], dtype=np.int64)
+    full_vocab_words = [w for w in vocab_words if w in word_to_idx]
     full_vocab_indices = np.asarray(
-        [word_to_idx[w] for w in sorted(counts.keys()) if w in word_to_idx],
+        [word_to_idx[w] for w in full_vocab_words],
         dtype=np.int64,
     )
     return {
         "word_to_idx": word_to_idx,
         "vocab50_words": vocab50_words,
         "vocab50_indices": vocab50_indices,
-        "full_vocab_words": [vocab_words[i] for i in full_vocab_indices],
+        "full_vocab_words": full_vocab_words,
         "full_vocab_indices": full_vocab_indices,
-        "train_word_counts": dict(counts),
+        "train_word_counts": dict(train_counts),
     }
 
 
@@ -348,9 +433,9 @@ def apply_leave_one_out_cms(
 ) -> tuple[torch.Tensor, dict[float, torch.Tensor]]:
     """Leave-One-Out Common-Mode Subtraction (LOO-CMS) on unit-normalized predictions.
 
-    - Clean (0s) subtracts the mean of all M historical shifted predictions.
-    - Each Shifted (delta_k) subtracts only the mean of the other M-1 shifted predictions,
-      guaranteeing zero self-subtraction leakage on the negative control.
+    - Clean (0s) subtracts the mean and adaptive common-mode projection of all M shifted predictions.
+    - Each Shifted (delta_k) subtracts only the mean and common-mode projection of the other M-1
+      shifted predictions, guaranteeing zero self-subtraction leakage on the negative control.
     """
     clean_norm = F.normalize(clean_predictions.float(), dim=-1, eps=1e-12)
     shift_keys = sorted(shifted_predictions.keys())
@@ -364,15 +449,24 @@ def apply_leave_one_out_cms(
     stacked = torch.stack([shifted_norm[k] for k in shift_keys], dim=0)
     sum_all = stacked.sum(dim=0)
     m = float(len(shift_keys))
-    debiased_clean = F.normalize(
-        clean_norm - float(eta) * (sum_all / m), dim=-1, eps=1e-12
-    )
+
+    def _debias(vec: torch.Tensor, mean_shift: torch.Tensor, m_eff: float) -> torch.Tensor:
+        r = torch.norm(mean_shift, dim=-1, keepdim=True)
+        mu_hat = mean_shift / torch.clamp(r, min=1e-12)
+        r0 = 1.0 / max(float(np.sqrt(max(m_eff, 1.0))), 1.0)
+        excess = torch.clamp((r - 0.5 * r0) / max(1.0 - 0.5 * r0, 1e-6), 0.0, 1.0)
+        proj_coeff = torch.clamp(
+            (vec * mu_hat).sum(dim=-1, keepdim=True), min=0.0
+        )
+        updated = vec - float(eta) * mean_shift - excess * proj_coeff * mu_hat
+        return F.normalize(updated, dim=-1, eps=1e-12)
+
+    mean_all = sum_all / m
+    debiased_clean = _debias(clean_norm, mean_all, m)
     debiased_shifted: dict[float, torch.Tensor] = {}
     for k in shift_keys:
         mean_other = (sum_all - shifted_norm[k]) / max(m - 1.0, 1.0)
-        debiased_shifted[k] = F.normalize(
-            shifted_norm[k] - float(eta) * mean_other, dim=-1, eps=1e-12
-        )
+        debiased_shifted[k] = _debias(shifted_norm[k], mean_other, max(m - 1.0, 1.0))
     return debiased_clean, debiased_shifted
 
 
@@ -436,10 +530,18 @@ def evaluate_word_retrieval(
 
         by_type10: dict[int, list[bool]] = defaultdict(list)
         by_type1: dict[int, list[bool]] = defaultdict(list)
-        for t_id, h10, h1 in zip(q_targets.tolist(), hit10.tolist(), hit1.tolist()):
+        by_func_type10: dict[int, list[bool]] = defaultdict(list)
+        by_cont_type10: dict[int, list[bool]] = defaultdict(list)
+        for t_id, is_f, h10, h1 in zip(
+            q_targets.tolist(), q_func.tolist(), hit10.tolist(), hit1.tolist()
+        ):
             if int(t_id) in cand_pos_map:
                 by_type10[int(t_id)].append(h10)
                 by_type1[int(t_id)].append(h1)
+                if is_f:
+                    by_func_type10[int(t_id)].append(h10)
+                else:
+                    by_cont_type10[int(t_id)].append(h10)
 
         macro10 = (
             100.0 * float(np.mean([np.mean(v) for v in by_type10.values()]))
@@ -450,6 +552,16 @@ def evaluate_word_retrieval(
             100.0 * float(np.mean([np.mean(v) for v in by_type1.values()]))
             if by_type1
             else 0.0
+        )
+        func_macro10 = (
+            100.0 * float(np.mean([np.mean(v) for v in by_func_type10.values()]))
+            if by_func_type10
+            else (100.0 * float(np.mean(hit10[q_func])) if q_func.any() else 0.0)
+        )
+        cont_macro10 = (
+            100.0 * float(np.mean([np.mean(v) for v in by_cont_type10.values()]))
+            if by_cont_type10
+            else (100.0 * float(np.mean(hit10[~q_func])) if (~q_func).any() else 0.0)
         )
         return {
             "queries": int(query_mask.sum()),
@@ -466,6 +578,8 @@ def evaluate_word_retrieval(
             "content_top10": 100.0 * float(np.mean(hit10[~q_func]))
             if (~q_func).any()
             else 0.0,
+            "function_macro_top10": func_macro10,
+            "content_macro_top10": cont_macro10,
         }
 
     return {
@@ -519,6 +633,8 @@ def summarize_clean_vs_shifted(
     fv_micro10_mean, _ = _agg("full_vocab", "micro_top10")
     func10_mean, _ = _agg("vocab50", "function_top10")
     cont10_mean, _ = _agg("vocab50", "content_top10")
+    fv_func10_mean, _ = _agg("full_vocab", "function_top10")
+    fv_cont10_mean, _ = _agg("full_vocab", "content_top10")
 
     c_v50 = clean_metrics["vocab50"]
     c_fv = clean_metrics["full_vocab"]
@@ -535,6 +651,8 @@ def summarize_clean_vs_shifted(
             "full_vocab_micro_top10": fv_micro10_mean,
             "function_top10": func10_mean,
             "content_top10": cont10_mean,
+            "full_vocab_function_top10": fv_func10_mean,
+            "full_vocab_content_top10": fv_cont10_mean,
         },
         "net_gain": {
             "vocab50_macro_top10": c_v50["macro_top10"] - v50_macro10_mean,
@@ -544,10 +662,65 @@ def summarize_clean_vs_shifted(
             "full_vocab_micro_top10": c_fv["micro_top10"] - fv_micro10_mean,
             "function_top10": c_v50["function_top10"] - func10_mean,
             "content_top10": c_v50["content_top10"] - cont10_mean,
+            "full_vocab_function_top10": c_fv["function_top10"] - fv_func10_mean,
+            "full_vocab_content_top10": c_fv["content_top10"] - fv_cont10_mean,
         },
         "shortcut_inflation_over_chance_v50_top10": v50_macro10_mean
         - c_v50["chance_top10"],
     }
+
+
+def compute_streaming_latency_stats(
+    onsets: np.ndarray,
+    durations: np.ndarray,
+    sentence_uids: Sequence[str],
+    window_offset: float,
+    window_duration: float,
+) -> dict[str, dict[str, float]]:
+    """Compute empirical post-onset and post-word-completion wait latencies (s) per streaming horizon."""
+    onsets_arr = np.asarray(onsets, dtype=np.float64)
+    durs_arr = np.asarray(durations, dtype=np.float64)
+    w_end = float(window_offset) + float(window_duration)
+
+    groups: dict[str, list[int]] = defaultdict(list)
+    for idx, suid in enumerate(sentence_uids):
+        groups[str(suid)].append(idx)
+
+    horizons_map: dict[str, int | None] = {
+        "K0": 0,
+        "K1": 1,
+        "K2": 2,
+        "Offline": None,
+    }
+    stats: dict[str, dict[str, float]] = {}
+    for key, r in horizons_map.items():
+        onset_waits: list[float] = []
+        completion_waits: list[float] = []
+        for rows in groups.values():
+            seq_len = len(rows)
+            for pos, i_idx in enumerate(rows):
+                target_pos = (seq_len - 1) if r is None else min(seq_len - 1, pos + int(r))
+                j_idx = rows[target_pos]
+                emit_time = float(onsets_arr[j_idx]) + w_end
+                onset_wait = max(0.0, emit_time - float(onsets_arr[i_idx]))
+                comp_wait = max(
+                    0.0, emit_time - (float(onsets_arr[i_idx]) + float(durs_arr[i_idx]))
+                )
+                onset_waits.append(onset_wait)
+                completion_waits.append(comp_wait)
+        stats[key] = {
+            "window_start_s": float(window_offset),
+            "window_end_s": float(w_end),
+            "post_onset_mean_s": float(np.mean(onset_waits)) if onset_waits else 0.0,
+            "post_onset_median_s": float(np.median(onset_waits)) if onset_waits else 0.0,
+            "post_completion_mean_s": float(np.mean(completion_waits))
+            if completion_waits
+            else 0.0,
+            "post_completion_median_s": float(np.median(completion_waits))
+            if completion_waits
+            else 0.0,
+        }
+    return {**stats, "horizons": dict(stats)}
 
 
 class TimingOnlyShortcutModel(nn.Module):
@@ -604,7 +777,7 @@ class TimingOnlyShortcutModel(nn.Module):
 
 
 class WordContextModel(nn.Module):
-    """Word-level neural encoder + optional sentence/rolling Transformer."""
+    """Word-level neural encoder + optional sentence/rolling Transformer with zero-init gated residual."""
 
     def __init__(
         self,
@@ -612,23 +785,28 @@ class WordContextModel(nn.Module):
         encoder_out_dim: int,
         embedding_dim: int = 1024,
         use_transformer: bool = False,
-        transformer_dim: int = 512,
-        transformer_depth: int = 4,
-        transformer_heads: int = 8,
+        transformer_dim: int = 256,
+        transformer_depth: int = 2,
+        transformer_heads: int = 4,
+        *,
+        gated_residual: bool = False,
+        history_radius: int = 2,
     ):
         super().__init__()
         self.brain_encoder = brain_encoder
         self.word_proj = nn.Linear(encoder_out_dim, embedding_dim)
         self.use_transformer = bool(use_transformer)
+        self.gated_residual = bool(gated_residual)
+        self.history_radius = int(history_radius)
         if self.use_transformer:
             self.in_proj = nn.Sequential(
                 nn.LayerNorm(embedding_dim),
-                nn.Linear(embedding_dim, transformer_dim),
+                nn.Linear(embedding_dim, transformer_dim, bias=False),
             )
             layer = nn.TransformerEncoderLayer(
                 d_model=transformer_dim,
                 nhead=transformer_heads,
-                dim_feedforward=transformer_dim * 4,
+                dim_feedforward=transformer_dim * 2,
                 dropout=0.1,
                 activation="gelu",
                 batch_first=True,
@@ -637,11 +815,84 @@ class WordContextModel(nn.Module):
             self.transformer = nn.TransformerEncoder(
                 layer, num_layers=transformer_depth, enable_nested_tensor=False
             )
-            self.out_proj = nn.Linear(transformer_dim, embedding_dim)
+            self.out_proj = nn.Linear(
+                transformer_dim, embedding_dim, bias=not self.gated_residual
+            )
+            self.context_alpha = nn.Parameter(torch.zeros(1))
+            self.rolling_in_proj = nn.ModuleDict(
+                {
+                    str(r): nn.Sequential(
+                        nn.LayerNorm(embedding_dim),
+                        nn.Linear(embedding_dim, transformer_dim, bias=False),
+                    )
+                    for r in (0, 1, 2)
+                }
+            )
+            self.rolling_transformers = nn.ModuleDict(
+                {
+                    str(r): nn.TransformerEncoder(
+                        nn.TransformerEncoderLayer(
+                            d_model=transformer_dim,
+                            nhead=transformer_heads,
+                            dim_feedforward=transformer_dim * 2,
+                            dropout=0.1,
+                            activation="gelu",
+                            batch_first=True,
+                            norm_first=True,
+                        ),
+                        num_layers=max(1, transformer_depth - 1),
+                        enable_nested_tensor=False,
+                    )
+                    for r in (0, 1, 2)
+                }
+            )
+            self.rolling_alpha = nn.ParameterDict(
+                {str(r): nn.Parameter(torch.zeros(1)) for r in (0, 1, 2)}
+            )
+            self.phase_alpha = nn.ParameterDict(
+                {str(r): nn.Parameter(torch.zeros(1)) for r in (0, 1, 2)}
+            )
+            self.rel_pos_scale = nn.ParameterDict(
+                {
+                    str(r): nn.Parameter(torch.zeros(9, transformer_dim))
+                    for r in (0, 1, 2)
+                }
+            )
+            self.rel_pos_emb = nn.ParameterDict(
+                {
+                    str(r): nn.Parameter(torch.randn(9, transformer_dim) * 0.02)
+                    for r in (0, 1, 2)
+                }
+            )
+            self.rolling_out_proj = nn.ModuleDict(
+                {
+                    str(r): nn.Linear(transformer_dim, embedding_dim, bias=False)
+                    for r in (0, 1, 2)
+                }
+            )
+            self.rolling_unmix_proj = nn.ModuleDict(
+                {
+                    str(r): nn.Linear(
+                        embedding_dim * (self.history_radius + r + 1),
+                        embedding_dim,
+                        bias=False,
+                    )
+                    for r in (0, 1, 2)
+                }
+            )
         else:
             self.in_proj = None
             self.transformer = None
             self.out_proj = None
+            self.context_alpha = None
+            self.rolling_in_proj = None
+            self.rolling_transformers = None
+            self.rolling_alpha = None
+            self.phase_alpha = None
+            self.rel_pos_scale = None
+            self.rel_pos_emb = None
+            self.rolling_out_proj = None
+            self.rolling_unmix_proj = None
 
     def encode_words(
         self,
@@ -656,10 +907,13 @@ class WordContextModel(nn.Module):
         self,
         word_embeddings: torch.Tensor,
         sentence_uids: Sequence[str],
-    ) -> torch.Tensor:
+        *,
+        return_raw_delta: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        z = F.normalize(word_embeddings.float(), dim=-1, eps=1e-12)
         if not self.use_transformer or self.transformer is None:
-            return F.normalize(word_embeddings.float(), dim=-1, eps=1e-12)
-        h = self.in_proj(word_embeddings.float())
+            return (z, torch.zeros_like(z)) if return_raw_delta else z
+        h = self.in_proj(z)
         groups: dict[str, list[int]] = defaultdict(list)
         for idx, uid in enumerate(sentence_uids):
             groups[str(uid)].append(idx)
@@ -671,10 +925,18 @@ class WordContextModel(nn.Module):
             batch_h[g_idx, : len(rows)] = h[rows]
             pad_mask[g_idx, : len(rows)] = False
         ctx = self.transformer(batch_h, src_key_padding_mask=pad_mask)
-        out = word_embeddings.new_zeros((len(word_embeddings), self.out_proj.out_features))
+        out = z.new_zeros((len(z), self.out_proj.out_features))
         for g_idx, rows in enumerate(group_list):
             out[rows] = self.out_proj(ctx[g_idx, : len(rows)])
-        return F.normalize(out + word_embeddings.float(), dim=-1, eps=1e-12)
+        if self.gated_residual and self.context_alpha is not None:
+            if len(out) > 1:
+                out = out - out.mean(dim=0, keepdim=True)
+            delta = F.normalize(out, dim=-1, eps=1e-12)
+            gate = torch.tanh(self.context_alpha)
+            pred = F.normalize(z + gate * delta, dim=-1, eps=1e-12)
+            return (pred, delta) if return_raw_delta else pred
+        pred = F.normalize(out + z, dim=-1, eps=1e-12)
+        return (pred, F.normalize(out, dim=-1, eps=1e-12)) if return_raw_delta else pred
 
     def forward_rolling_from_embeddings(
         self,
@@ -682,39 +944,125 @@ class WordContextModel(nn.Module):
         sentence_uids: Sequence[str],
         horizons: Sequence[int] = (0, 1, 2),
         history_radius: int = 2,
-    ) -> dict[int, torch.Tensor]:
-        """Single-pass local-window rolling revision (K0, K1, K2) on frozen word embeddings."""
-        if not self.use_transformer or self.transformer is None:
-            normed = F.normalize(word_embeddings.float(), dim=-1, eps=1e-12)
-            return {int(r): normed for r in horizons}
+        *,
+        lag_embeddings: Sequence[torch.Tensor] | None = None,
+        return_raw_deltas: bool = False,
+    ) -> dict[int, torch.Tensor] | tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+        """Progressive local-window rolling revision (z -> K0 -> K1 -> K2) with relative position & zero-init residual."""
+        z = F.normalize(word_embeddings.float(), dim=-1, eps=1e-12)
+        if not self.use_transformer or self.rolling_transformers is None:
+            out_dict = {int(r): z for r in horizons}
+            return (out_dict, out_dict) if return_raw_deltas else out_dict
 
-        h = self.in_proj(word_embeddings.float())
+        lag_normed: list[torch.Tensor] = []
+        if lag_embeddings is not None:
+            if isinstance(lag_embeddings, torch.Tensor) and lag_embeddings.ndim == 3:
+                lag_normed = [
+                    F.normalize(lag_embeddings[:, i].to(z.device).float(), dim=-1, eps=1e-12)
+                    for i in range(lag_embeddings.shape[1])
+                ]
+            else:
+                lag_normed = [
+                    F.normalize(le.to(z.device).float(), dim=-1, eps=1e-12)
+                    for le in lag_embeddings
+                ]
+
         groups: dict[str, list[int]] = defaultdict(list)
         for idx, uid in enumerate(sentence_uids):
             groups[str(uid)].append(idx)
 
-        results: dict[int, torch.Tensor] = {}
-        n_total = len(word_embeddings)
+        req_horizons = [int(r) for r in horizons]
+        max_h = min(max(req_horizons, default=0), 2)
+        all_results: dict[int, torch.Tensor] = {}
+        all_deltas: dict[int, torch.Tensor] = {}
+        n_total, emb_dim = z.shape
+        hist_r = int(history_radius)
+        prev_state = z
 
-        for r in horizons:
-            r_int = int(r)
-            width = int(history_radius) + r_int + 1
-            windows = h.new_zeros((n_total, width, h.shape[-1]))
-            pad_mask = torch.ones((n_total, width), dtype=torch.bool, device=h.device)
-            for rows in groups.values():
-                seq_len = len(rows)
-                for pos, target_row in enumerate(rows):
-                    eff_right = min(r_int, seq_len - 1 - pos)
-                    for col, offset in enumerate(range(-int(history_radius), eff_right + 1)):
-                        nbr = pos + offset
-                        if 0 <= nbr < seq_len:
-                            windows[target_row, col] = h[rows[nbr]]
-                            pad_mask[target_row, col] = False
-            ctx = self.transformer(windows, src_key_padding_mask=pad_mask)
-            delta = self.out_proj(ctx[:, int(history_radius)])
-            results[r_int] = F.normalize(
-                word_embeddings.float() + delta, dim=-1, eps=1e-12
+        for r_int in range(max_h + 1):
+            r_key = str(r_int)
+            base_z = prev_state
+            if r_int < len(lag_normed) and self.phase_alpha is not None:
+                p_gate = torch.tanh(self.phase_alpha[r_key])
+                lag_vec = lag_normed[r_int]
+                # Orthogonalize lag phase component against current state or add directly
+                lag_diff = lag_vec - (lag_vec * base_z).sum(dim=-1, keepdim=True) * base_z
+                if n_total > 1:
+                    lag_diff = lag_diff - lag_diff.mean(dim=0, keepdim=True)
+                lag_unit = F.normalize(lag_vec + 0.5 * lag_diff, dim=-1, eps=1e-12)
+                base_z = F.normalize(base_z + p_gate * lag_unit, dim=-1, eps=1e-12)
+            else:
+                lag_unit = torch.zeros_like(base_z)
+
+            col_tensors: list[torch.Tensor] = []
+            scales: list[torch.Tensor] = []
+            biases: list[torch.Tensor] = []
+            for offset in range(-hist_r, r_int + 1):
+                rel_idx = min(max(offset + 4, 0), 8)
+                scales.append(1.0 + self.rel_pos_scale[r_key][rel_idx])
+                biases.append(self.rel_pos_emb[r_key][rel_idx])
+                if offset == 0:
+                    col_tensors.append(base_z)
+                else:
+                    nbr_row_idx = list(range(n_total))
+                    is_self = [False] * n_total
+                    for rows in groups.values():
+                        seq_len = len(rows)
+                        for pos, target_row in enumerate(rows):
+                            avail_len = min(seq_len, pos + r_int + 1)
+                            if avail_len <= 1:
+                                nbr_row_idx[target_row] = target_row
+                                is_self[target_row] = True
+                            else:
+                                cand_pos = pos + offset
+                                if 0 <= cand_pos < avail_len:
+                                    nbr_pos = cand_pos
+                                else:
+                                    nbr_pos = cand_pos % avail_len
+                                    if nbr_pos == pos:
+                                        nbr_pos = (pos + 1) % avail_len
+                                nbr_row_idx[target_row] = rows[nbr_pos]
+                    nbr_idx_t = torch.tensor(nbr_row_idx, dtype=torch.long, device=z.device)
+                    nbr_vecs = z[nbr_idx_t]
+                    collinear = (nbr_vecs * base_z).sum(dim=-1, keepdim=True) * base_z
+                    ortho_vecs = F.normalize(nbr_vecs - collinear, dim=-1, eps=1e-12)
+                    if any(is_self):
+                        self_mask = torch.tensor(
+                            is_self, dtype=torch.bool, device=z.device
+                        ).unsqueeze(-1)
+                        ortho_vecs = torch.where(self_mask, base_z, ortho_vecs)
+                    col_tensors.append(ortho_vecs)
+
+            windows_emb = torch.stack(col_tensors, dim=1)
+            scale_t = torch.stack(scales, dim=0).unsqueeze(0)
+            bias_t = torch.stack(biases, dim=0).unsqueeze(0)
+            h_win = self.rolling_in_proj[r_key](windows_emb) * scale_t + bias_t
+
+            # No src_key_padding_mask: all width slots are populated, eliminating pos=0 boundary leaks
+            ctx = self.rolling_transformers[r_key](h_win)
+            attn_delta = self.rolling_out_proj[r_key](ctx[:, hist_r])
+            if windows_emb.shape[1] == self.history_radius + r_int + 1:
+                unmix_delta = self.rolling_unmix_proj[r_key](
+                    windows_emb.reshape(n_total, -1)
+                )
+                raw_delta = attn_delta + 0.5 * unmix_delta
+            else:
+                raw_delta = attn_delta
+
+            if n_total > 1:
+                raw_delta = raw_delta - raw_delta.mean(dim=0, keepdim=True)
+            unit_delta = F.normalize(raw_delta + 0.35 * lag_unit, dim=-1, eps=1e-12)
+            gate = torch.tanh(self.rolling_alpha[r_key])
+            prev_state = F.normalize(
+                base_z + gate * unit_delta, dim=-1, eps=1e-12
             )
+            all_results[r_int] = prev_state
+            all_deltas[r_int] = unit_delta
+
+        results = {r: all_results[min(max(r, 0), max_h)] for r in req_horizons}
+        raw_deltas = {r: all_deltas[min(max(r, 0), max_h)] for r in req_horizons}
+        if return_raw_deltas:
+            return results, raw_deltas
         return results
 
     def forward(

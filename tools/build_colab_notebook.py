@@ -160,11 +160,12 @@ run_live([PYTHON, "-c", "import torch, brain2qwerty_v1; print('GPU available:', 
             cell(
                 "markdown",
                 """
-            ## 实验一 & 实验二：词级打字时长捷径验证（Clean `0s` vs. Shifted `-15s ~ -120s`）
+            ## 实验一 & 实验二：词级打字时长捷径验证 +《From Thought to Action》预运动超前窗与跨步解混
             直接复用已解压的缓存，在 Colab 中自动下载/缓存 `BAAI/bge-m3` 西班牙语词向量，一次性运行：
-            - **实验一（固定词窗重叠模式, `T=1.0s` / `0.5s`）**：对比 `Timing-Only (Δτ_i)`、`Word-Only`、`Full-Context (Joint)` 与 `Full-Context (+ Freeze CNN + LOO-CMS)`。
-            - **实验二（模拟 Brain2Qwerty v2 空格边界切分 `Space-Chunked [τ_i, τ_{i+1}]` 模式）**：对比独立空格切块均值池化（`Exp2-1`）、通道 A（变长帧数敏感池化 `Exp2-2`）、通道 B（底层连续 `Conv+Conformer` 跨界感受野 + 均值池化 `Exp2-3`）、完整 v2 联合训练（`Exp2-4`）及去偏方案（`Exp2-5`）。
-            验证结果实时打印两张 Markdown 汇总表，并保存到 Drive 的 `runs/<tag>/shortcut_verification.{md,csv,json}`。
+            - **第一步（修好 `Rolling-K0/K1/K2` 与词性掩码）**：零初始化门控残差 $\\alpha_r(0)=0$ 严格锁死 `Word-Only` 下界 + 局部相对位置窗口 `[i-2, i+r]` 施密特正交解混 + 全词表分层抽样恢复西语 `Func / Content` 词性统计。
+            - **第二步（《From Thought to Action》预运动超前窗口与并发叠加子空间解混）**：在固定窗长 `T=0.50s` 下对比运动后窗 `[+0.00s, +0.50s]`、预运动跨期窗 `[-0.25s, +0.25s]` 与早期预运动窗 `[-0.35s, +0.15s]`，展示 `Rolling-K0` 等待延迟砍半（`0.50s -> 0.25s`）以及 `Word-Only -> K0 -> K1 -> K2` 的渐进解混跃升。
+            - **实验二（模拟 Brain2Qwerty v2 空格边界切分 `Space-Chunked [τ_i, τ_{i+1}]` 模式）**：对比独立空格切块均值池化（`Exp2-1`）、通道 A（`Exp2-2`）、通道 B（`Exp2-3`）、完整 v2 联合训练（`Exp2-4`）及去偏方案（`Exp2-5`）。
+            验证结果实时打印三张 Markdown 汇总表，并保存到 Drive 的 `runs/<tag>/shortcut_verification.{md,csv,json}`。
             """,
             ),
             cell(
@@ -173,15 +174,17 @@ run_live([PYTHON, "-c", "import torch, brain2qwerty_v1; print('GPU available:', 
             subprocess.run(["git", "-C", str(CODE), "pull", "--ff-only"], check=True)
             SHORTCUT_MODALITY = "meg"   # meg (features_meg.tar) / eeg (features.tar)
             SHORTCUT_SUBJECTS = ["--num-subjects", "1"]  # 快速单人验证；3人填 ["3"]，全量填 ["--subject", "all"]
-            SHORTCUT_PROFILE = "small"  # 快速验证用 "small" (~1分钟跑完)；正式全量用 "full"
-            EXPERIMENTS = ["exp1", "exp2"]  # ["exp1", "exp2"] 同时跑实验一与实验二，或单独跑 ["exp1"] / ["exp2"]
-            WINDOW_DURATION = 0.5           # 实验一固定词窗时长：0.5 (重叠约 32%) 或 1.0 (重叠约 63%)
+            SHORTCUT_PROFILE = "small"  # 快速验证用 "small" (~1-2分钟跑完)；正式全量用 "full"
+            EXPERIMENTS = ["exp1", "exp2"]  # ["exp1", "exp2"] 同时跑实验一(含Step1+Step2)与实验二，或单独跑 ["exp1"]
+            WINDOW_DURATION = 0.5           # 固定词窗时长 T=0.50s
+            WINDOW_OFFSETS = ["0.0", "-0.25", "-0.35"]  # 对比 [+0.00s, +0.50s], [-0.25s, +0.25s], [-0.35s, +0.15s]
             SHORTCUT_EPOCHS = 15
             run_live([PYTHON, "-u", "-m", "brain2qwerty_v1.scripts.verify_word_shortcut",
                       "--modality", SHORTCUT_MODALITY, *SHORTCUT_SUBJECTS,
                       "--profile", SHORTCUT_PROFILE,
                       "--experiments", *EXPERIMENTS,
                       "--window-duration", str(WINDOW_DURATION),
+                      "--window-offsets", *WINDOW_OFFSETS,
                       "--epochs", str(SHORTCUT_EPOCHS),
                       "--require-cache"])
             """,

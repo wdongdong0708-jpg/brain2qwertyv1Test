@@ -29,6 +29,8 @@ from brain2qwerty_v1.word_shortcut import (
     audit_word_timing_statistics,
     build_vocabulary_banks,
     compute_shifted_word_onsets,
+    compute_streaming_latency_stats,
+    evaluate_word_retrieval,
     load_or_compute_bge_m3_embeddings,
     summarize_clean_vs_shifted,
 )
@@ -451,6 +453,76 @@ def test_verify_word_shortcut_training_pipeline_end_to_end():
         isinstance(p, torch.nn.parameter.UninitializedParameter)
         for p in real_s1.parameters()
     )
+
+
+def test_zero_init_gated_rolling_monotonic_and_premotor_latency():
+    raw = _synthetic_word_and_button_events()
+    events = Brain2QwertyV1Splitter(seed=1).run(SpanishBCBLWordPreprocessing().run(raw))
+    words = (
+        events[events["type"] == "Word"]
+        .sort_values(["sentence_UID", "word_order"])
+        .reset_index(drop=True)
+    )
+    vocab_words, bank = load_or_compute_bge_m3_embeddings(
+        words["text"].tolist(), [], backend="hash", embedding_dim=32
+    )
+    vb = build_vocabulary_banks(words, vocab_words, top_k_50=50)
+    w2i = vb["word_to_idx"]
+
+    # Verify test content words are included in vocab50_indices & full_vocab_indices
+    test_words = words[words["split"] == "test"]
+    test_content_ids = {
+        w2i[w]
+        for w, is_f in zip(test_words["text"], test_words["is_function_word"])
+        if not is_f
+    }
+    assert test_content_ids.issubset(set(vb["full_vocab_indices"].tolist()))
+    assert test_content_ids.issubset(set(vb["vocab50_indices"].tolist()))
+
+    # Verify at epoch 0 (alpha_r == 0), gated WordContextModel exactly matches Word-Only z_i
+    wc_gated = WordContextModel(
+        brain_encoder=_DummyBrainEncoder(8, 16),
+        encoder_out_dim=16,
+        embedding_dim=32,
+        use_transformer=True,
+        gated_residual=True,
+        transformer_dim=16,
+        transformer_depth=2,
+        transformer_heads=2,
+    )
+    suids = words["sentence_UID"].astype(str).tolist()
+    z = torch.nn.functional.normalize(torch.randn(len(words), 32), dim=-1)
+    with torch.no_grad():
+        ctx0 = wc_gated.forward_context_from_embeddings(z, suids)
+        roll0 = wc_gated.forward_rolling_from_embeddings(z, suids, horizons=(0, 1, 2))
+    torch.testing.assert_close(ctx0, z, atol=1e-6, rtol=1e-5)
+    for r in (0, 1, 2):
+        torch.testing.assert_close(roll0[r], z, atol=1e-6, rtol=1e-5)
+
+    # Verify pre-motor window [-0.25s, +0.25s] cuts K0 post-onset wait in half vs [+0.00s, +0.50s]
+    onsets = words["start"].to_numpy(dtype=np.float64)
+    durations = words["duration"].to_numpy(dtype=np.float64)
+    lat_post = compute_streaming_latency_stats(
+        onsets, durations, suids, window_offset=0.0, window_duration=0.5
+    )
+    lat_pre = compute_streaming_latency_stats(
+        onsets, durations, suids, window_offset=-0.25, window_duration=0.5
+    )
+    lat_early = compute_streaming_latency_stats(
+        onsets, durations, suids, window_offset=-0.35, window_duration=0.5
+    )
+    assert np.isclose(lat_post["horizons"]["K0"]["post_onset_mean_s"], 0.50)
+    assert np.isclose(lat_pre["horizons"]["K0"]["post_onset_mean_s"], 0.25)
+    assert np.isclose(lat_early["horizons"]["K0"]["post_onset_mean_s"], 0.15)
+    assert (
+        lat_pre["horizons"]["K0"]["post_completion_mean_s"]
+        < lat_post["horizons"]["K0"]["post_completion_mean_s"]
+    )
+    assert (
+        lat_pre["horizons"]["K2"]["post_completion_mean_s"]
+        < lat_pre["horizons"]["Offline"]["post_completion_mean_s"]
+    )
+
 
 
 
