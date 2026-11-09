@@ -335,10 +335,8 @@ def load_or_compute_bge_m3_embeddings(
                     continue
 
     raw_emb = np.stack([cached_map[w] for w in unique_words]).astype(np.float32)
-    vocab_mean = raw_emb.mean(axis=0, keepdims=True)
-    centered_emb = raw_emb - vocab_mean
-    embedding_matrix_np = centered_emb / np.clip(
-        np.linalg.norm(centered_emb, axis=-1, keepdims=True), 1e-12, None
+    embedding_matrix_np = raw_emb / np.clip(
+        np.linalg.norm(raw_emb, axis=-1, keepdims=True), 1e-12, None
     )
     return unique_words, embedding_matrix_np.astype(np.float32)
 
@@ -1044,18 +1042,12 @@ class WordContextModel(nn.Module):
                         seq_len = len(rows)
                         for pos, target_row in enumerate(rows):
                             avail_len = min(seq_len, pos + r_int + 1)
-                            if avail_len <= 1:
+                            cand_pos = pos + offset
+                            if 0 <= cand_pos < avail_len:
+                                nbr_row_idx[target_row] = rows[cand_pos]
+                            else:
                                 nbr_row_idx[target_row] = target_row
                                 is_self[target_row] = True
-                            else:
-                                cand_pos = pos + offset
-                                if 0 <= cand_pos < avail_len:
-                                    nbr_pos = cand_pos
-                                else:
-                                    nbr_pos = cand_pos % avail_len
-                                    if nbr_pos == pos:
-                                        nbr_pos = (pos + 1) % avail_len
-                                nbr_row_idx[target_row] = rows[nbr_pos]
                     nbr_idx_t = torch.tensor(nbr_row_idx, dtype=torch.long, device=z.device)
                     nbr_vecs = z[nbr_idx_t]
                     collinear = (nbr_vecs * base_z).sum(dim=-1, keepdim=True) * base_z

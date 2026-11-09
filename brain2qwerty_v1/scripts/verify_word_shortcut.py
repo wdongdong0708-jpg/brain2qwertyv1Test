@@ -850,7 +850,17 @@ def train_frozen_context_transformer(
 
         val_w = val_stage1_embs.to(device)
         val_lag = val_lag_embs.to(device) if val_lag_embs is not None else None
-        best_stage_val: tuple[float, float, float, float] | None = None
+        model.eval()
+        with torch.no_grad():
+            init_preds_dev = model.forward_rolling_from_embeddings(
+                val_w,
+                val_bundle.sentence_uids,
+                horizons=(r_stage,),
+                history_radius=2,
+                lag_embeddings=val_lag,
+            )[r_stage]
+            init_loss_v = float(criterion(init_preds_dev, val_targets_dev).detach().cpu())
+            best_stage_val = _val_tuple(init_preds_dev.cpu(), init_loss_v)
         best_stage_state = copy.deepcopy(model.state_dict())
 
         for _ in range(stage_epochs):
